@@ -4,7 +4,7 @@ import { BLOCKS, MODELS, MODEL, optLabel, LOWER_BETTER } from './registry.js';
 import { nodeTitle } from './canvas.js';
 
 export const FALLBACK_MODELS = ['gpt-oss:120b', 'gpt-oss:20b', 'qwen3-coder-next', 'kimi-k2.6', 'glm-4.7', 'deepseek-v3.2', 'minimax-m2.7', 'qwen3-next:80b', 'gemma4:31b'];
-const DEFAULTS = { provider: 'cloud', apiKey: '', remember: true, model: 'gpt-oss:120b', baseUrl: 'http://localhost:11434', temperature: 0.3, confirm: true, think: 'default', proxy: '/api/ollama' };
+const DEFAULTS = { provider: 'cloud', apiKey: '', remember: true, model: 'gpt-oss:120b', baseUrl: 'http://localhost:11434', temperature: 0.3, confirm: true, autoFix: true, think: 'default', proxy: '/api/ollama' };
 export const AI = { ...DEFAULTS, ...store.get('ai', {}) };
 if (!AI.remember) AI.apiKey = sessionStorage.getItem('mlagent.key') || '';
 export function saveAI(patch) {
@@ -119,6 +119,15 @@ How to work:
 - Reply in the user's language (Bengali or English); keep ML terms in English.
 - The user may have to approve pipeline changes and code before they run.
 
+Debugging and quality protocol (use it whenever something fails, looks wrong, or the user asks you to check or fix something):
+1. Gather facts: diagnose (Pipeline Doctor), get_model_details, list_code_cells, and the error_info of run_python / write_code_cell (failing line, hint, available names or columns).
+2. Find the root cause and say whether it is a code error or a conceptual ML error (leakage, wrong validation, wrong metric, overfitting …).
+3. Fix it with the smallest correct change: apply_fixes for doctor issues, update_block for settings and hyperparameters, write_code_cell with the same cell_id to correct code. Never hide errors with bare try/except, never delete a model, column or cell just to make an error disappear unless that is the right fix, and never train, tune or select models on the test set.
+4. Verify: re-run the cell, retrain_models for changed model blocks, or run_pipeline when data, split, preprocessing or features changed. If it still fails, repeat (up to 3 attempts), then explain what blocks it.
+5. Report briefly: what was wrong, what you changed, and the result after the fix.
+Code you run also gets static-review warnings (for example fitting on the test set); treat them as bugs and fix them.
+Python Lab: the user's notebook cells (list_code_cells / write_code_cell). Cells and run_python share one namespace.
+
 ## Current state
 ${dataSummary()}
 Target: ${nodeOf('dataset')?.cfg.target || 'not set'}.
@@ -126,6 +135,7 @@ Pipeline blocks:
 ${pipelineSummary()}
 Results:
 ${resultsSummary()}
+${S.diag?.issues?.length ? `\nPipeline Doctor (last check): ${S.diag.issues.filter(i => i.severity !== 'info').slice(0, 8).map(i => `[${i.severity}] ${i.title} (id ${i.id})`).join('; ') || 'only informational notes'}.` : ''}
 ${focus ? `\nThe user is looking at block ${focus.id} (${nodeTitle(focus)}). Focus on it.` : ''}
 ${S.instructions ? `\n## User instructions\n${S.instructions.slice(0, 3000)}` : ''}
 ${docs ? `\n## Extra documents\n${docs.slice(0, 12000)}` : ''}
@@ -158,9 +168,14 @@ export const TOOLS = [
   fn('run_python', 'Run Python code in the in-browser engine with the data and the trained models (see the namespace in the system prompt). Returns printed output, the last expression, tables and figures.', { code: { type: 'string' } }, ['code']),
   fn('show_in_dashboard', 'Open a dashboard tab for the user, optionally for a specific model.', { tab: { type: 'string', enum: ['overview', 'leaderboard', 'model', 'compare', 'tuning', 'explain', 'data', 'predict', 'logs', 'runs'] }, model_id: { type: 'string' } }, ['tab']),
   fn('get_test_rows', 'Get rows of the test set (raw columns) to pick examples for predictions or what-if analysis.', { start: { type: 'integer' }, count: { type: 'integer' } }),
+  fn('diagnose', 'Run the Pipeline Doctor: checks the current pipeline, data and last results for code-level and conceptual ML problems (target leakage, ID columns, wrong task or metric, selecting models on the test set, time data shuffled, missing scaling, class imbalance, feature explosion, failed models with hints, overfitting, suspiciously perfect scores, no better than baseline, unstable CV). Each issue has an id and, when possible, a machine-applicable fix.'),
+  fn('apply_fixes', 'Apply the suggested fixes of Pipeline Doctor issues (from diagnose) to the pipeline.', { issue_ids: { type: 'array', items: { type: 'string' }, description: 'Issue ids from diagnose, or ["all"] for every issue that has a fix.' } }, ['issue_ids']),
+  fn('retrain_models', 'Retrain only the given model blocks on the existing data split (fast way to verify a hyperparameter fix). If data, split or preprocessing changed, use run_pipeline instead.', { model_ids: { type: 'array', items: { type: 'string' }, description: 'Model block ids (e.g. "n7") or model keys (e.g. "rf").' } }, ['model_ids']),
+  fn('list_code_cells', 'List the Python Lab cells (the user\'s notebook) with their code, status, errors and warnings.'),
+  fn('write_code_cell', 'Create or replace a Python Lab cell and (by default) run it. Use it to write analysis code and to correct cells that fail: pass the same cell_id to replace the broken code. Returns output, error_info (failing line, hint) and static-review warnings.', { cell_id: { type: 'string', description: 'Existing cell id to replace, or omit for a new cell' }, code: { type: 'string' }, run: { type: 'boolean', description: 'Default true' } }, ['code']),
   fn('export', 'Download something for the user.', { what: { type: 'string', enum: ['project_zip', 'model_file', 'test_predictions', 'leaderboard_csv', 'pipeline_json'] }, model_id: { type: 'string' } }, ['what']),
 ];
-const MUTATING = new Set(['update_block', 'add_block', 'remove_block', 'run_pipeline', 'run_python']);
+const MUTATING = new Set(['update_block', 'add_block', 'remove_block', 'run_pipeline', 'run_python', 'apply_fixes', 'retrain_models', 'write_code_cell']);
 let API = null;
 export function setAgentAPI(api) { API = api; }
 
@@ -192,6 +207,11 @@ async function execTool(name, args) {
     case 'show_in_dashboard': return API.show(args.tab, args.model_id);
     case 'get_test_rows': return API.testRows(args.start || 0, Math.min(50, args.count || 10));
     case 'export': return API.exportThing(args.what, args.model_id);
+    case 'diagnose': return API.diagnose();
+    case 'apply_fixes': return API.applyFixes(args.issue_ids || ['all']);
+    case 'retrain_models': return API.retrainModels(Array.isArray(args.model_ids) ? args.model_ids : [args.model_ids]);
+    case 'list_code_cells': return API.listCells();
+    case 'write_code_cell': return API.writeCell(args.cell_id, args.code, args.run);
     default: throw new Error('Unknown tool ' + name);
   }
 }
@@ -256,7 +276,7 @@ export async function runAgent(thread, text, { focus = null, onUpdate = () => {}
   onUpdate();
 }
 function stripForModel(name, out) {
-  if (name === 'run_python' && out) return { ...out, figures: out.figures ? `${out.figures.length} figure(s) shown to the user` : undefined };
+  if ((name === 'run_python' || name === 'write_code_cell') && out) return { ...out, figures: out.figures ? `${out.figures.length} figure(s) shown to the user` : undefined };
   return out;
 }
 

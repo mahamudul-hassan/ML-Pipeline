@@ -176,14 +176,16 @@ export const BLOCKS = {
     { k: 'perm_repeats', l: 'Permutation repeats', f: 'int', d: 5, min: 1, max: 30, adv: 1 },
     { k: 'shap_rows', l: 'Test rows explained by SHAP', f: 'int', d: 40, min: 5, max: 300, adv: 1 },
   ] },
-  tuning: { t: 'Hyperparameter Tuning', d: 'Grid, random or successive-halving search', c: '#6d28d9', i: 'sliders', rank: 7, fields: [
-    { k: 'method', l: 'Search method', f: 'cat', o: ['random', 'grid', 'halving_grid', 'halving_random'], d: 'random' },
+  tuning: { t: 'Hyperparameter Tuning', d: 'Optuna, Bayesian, grid, random or halving search', c: '#6d28d9', i: 'sliders', rank: 7, fields: [
+    { k: 'method', l: 'Search method', f: 'cat', o: ['optuna', 'bayesian', 'random', 'grid', 'halving_grid', 'halving_random'], d: 'optuna' },
     { k: 'models', l: 'Models to tune', f: 'cat', o: ['best', 'top3', 'top5', 'all'], d: 'top3' },
-    { k: 'n_iter', l: 'Candidates per model (random search)', f: 'int', d: 12, min: 2, max: 200 },
+    { k: 'n_iter', l: 'Trials per model (Optuna / Bayesian / random)', f: 'int', d: 20, min: 2, max: 500 },
     { k: 'cv_folds', l: 'CV folds during search', f: 'int', d: 3, min: 2, max: 10 },
     { k: 'enabled', l: 'Tune automatically after training', f: 'bool', d: true, op: 1 },
+    { k: 'sampler', l: 'Optuna sampler', f: 'cat', o: ['tpe', 'random', 'qmc'], d: 'tpe', adv: 1 },
+    { k: 'timeout', l: 'Time limit per model in seconds (0 = no limit)', f: 'int', d: 0, min: 0, max: 7200, adv: 1 },
     { k: 'max_grid', l: 'Switch grid to random above this many combinations', f: 'int', d: 60, min: 4, max: 5000, adv: 1 },
-    { k: 'grids', l: 'Custom search spaces (JSON: {"rf": {"n_estimators": [100, 300]}})', f: 'json', d: {}, adv: 1 },
+    { k: 'grids', l: 'Custom search spaces (JSON). Lists or ranges: {"rf": {"n_estimators": {"low": 50, "high": 600, "type": "int"}, "max_depth": [null, 8, 16]}}', f: 'json', d: {}, adv: 1 },
   ] },
   deploy: { t: 'Deployment / Export', d: 'Model file, Python project, API', c: '#be185d', i: 'rocket', rank: 8, fields: [] },
 };
@@ -196,7 +198,7 @@ export const OPT_LABEL = {
   kfold: 'K-fold', stratified_kfold: 'Stratified K-fold', repeated_kfold: 'Repeated K-fold', repeated_stratified_kfold: 'Repeated stratified K-fold', shuffle_split: 'Shuffle split', stratified_shuffle_split: 'Stratified shuffle split', time_series: 'Time-series split', group_kfold: 'Group K-fold',
   kbest_f: 'SelectKBest (ANOVA F / F-test)', kbest_mi: 'SelectKBest (mutual information)', kbest_chi2: 'SelectKBest (chi²)', percentile_f: 'SelectPercentile (F-test)', rfe: 'RFE', rfecv: 'RFECV', l1: 'L1-based (SelectFromModel)', tree_importance: 'Tree importance (SelectFromModel)', sfs_forward: 'Sequential forward', sfs_backward: 'Sequential backward',
   pca: 'PCA', svd: 'Truncated SVD', ica: 'FastICA', kernel_pca: 'Kernel PCA', lda: 'LDA projection', linear: 'Linear', rf: 'Random forest',
-  best: 'Best model', top3: 'Top 3', top5: 'Top 5', all: 'All models', random: 'Random search', grid: 'Grid search', halving_grid: 'Halving grid search', halving_random: 'Halving random search',
+  best: 'Best model', top3: 'Top 3', top5: 'Top 5', all: 'All models', optuna: 'Optuna (Bayesian TPE)', bayesian: 'Bayesian (Gaussian process)', tpe: 'TPE', qmc: 'Quasi-Monte Carlo', random: 'Random search', grid: 'Grid search', halving_grid: 'Halving grid search', halving_random: 'Halving random search',
   accuracy: 'Accuracy', balanced_accuracy: 'Balanced accuracy', f1: 'F1', f1_weighted: 'F1 (weighted)', precision: 'Precision', recall: 'Recall', roc_auc: 'ROC AUC', average_precision: 'Average precision', mcc: 'MCC', log_loss: 'Log loss', kappa: "Cohen's kappa",
   r2: 'R²', rmse: 'RMSE', mae: 'MAE', mape: 'MAPE', medae: 'Median AE', explained_variance: 'Explained variance', max_error: 'Max error', soft: 'Soft', hard: 'Hard', uniform: 'Uniform', kmeans: 'K-means', quantile: 'Quantile',
   0: 'Off', 2: 'Degree 2', 3: 'Degree 3',
@@ -266,11 +268,12 @@ export function gridForEngine(key, grid) {
   const out = {};
   for (const [k, vals] of Object.entries(grid || {})) {
     const p = MODEL[key]?.params.find(x => x.k === k);
-    out[k] = p && p.t === 'tuple' ? vals.map(v => (typeof v === 'string' ? v.split(',').map(Number) : v)) : vals;
+    out[k] = p && p.t === 'tuple' && Array.isArray(vals) ? vals.map(v => (typeof v === 'string' ? v.split(',').map(Number) : v)) : vals;
   }
   return out;
 }
 export function modelSpec(id, key, params, task) {
   const m = MODEL[key];
-  return { id, key, name: m.name, family: m.fam, cls: typeof m.cls === 'string' ? m.cls : m.cls, tasks: m.tasks, params: paramsForEngine(key, params), grid: gridForEngine(key, m.grid), flags: m.flags || {} };
+  const space = Object.fromEntries(m.params.map(p => [p.k, { type: p.t, log: !!p.log, cat: !!p.o || p.t === 'tuple' || p.t === 'bool' }]));
+  return { id, key, name: m.name, family: m.fam, cls: typeof m.cls === 'string' ? m.cls : m.cls, tasks: m.tasks, params: paramsForEngine(key, params), grid: gridForEngine(key, m.grid), space, flags: m.flags || {} };
 }

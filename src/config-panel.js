@@ -100,7 +100,7 @@ function fieldsBlock(n) {
     const adv = h('details', { class: 'adv' }, h('summary', {}, 'Tuning search space', h('span', { html: icon('chev', 16) })));
     const gridText = n.grid || '';
     adv.append(h('textarea', { rows: 5, class: 'mono', style: 'font-size:12px', placeholder: JSON.stringify(m.grid), 'aria-label': 'Search space JSON', onchange: e => { const t = e.target.value.trim(); if (!t) { n.grid = ''; changed(); return; } try { JSON.parse(t); n.grid = t; e.target.style.borderColor = ''; changed(); } catch { e.target.style.borderColor = 'var(--err)'; toast('That is not valid JSON.'); } } }, gridText),
-      h('div', { class: 'xs muted', style: 'margin-top:6px' }, 'Leave empty to use the default grid shown as the placeholder. Used by the Hyperparameter Tuning block.'));
+      h('div', { class: 'xs muted', style: 'margin-top:6px' }, 'Leave empty to use the default shown as the placeholder. Lists are tried as given by grid search; Optuna and Bayesian search treat numeric lists as ranges. You can also give ranges: {"n_estimators": {"low": 50, "high": 600, "type": "int"}, "learning_rate": {"low": 0.01, "high": 0.3, "log": true}}.'));
     out.push(adv);
     return out;
   }
@@ -116,7 +116,7 @@ function fieldsBlock(n) {
     out.push(d);
   }
   if (n.type === 'split') out.push(h('div', { class: 'note' }, 'Models are ranked by cross-validation on the training set (or the validation set when CV is off). The test set is only used for the final, unbiased report.'));
-  if (n.type === 'tuning') out.push(h('div', { class: 'note' }, 'Each model block has its own search space (open a model → "Tuning search space"). Tuned models are added to the leaderboard as "(tuned)".'));
+  if (n.type === 'tuning') out.push(h('div', { class: 'note' }, 'Optuna (TPE Bayesian optimisation) is the default: it learns from earlier trials which hyperparameters work. Numeric lists in a model\'s search space become continuous ranges (log scale for C, alpha, learning rate…). Each model block has its own search space (open a model → "Tuning search space"); ranges look like {"low": 0.01, "high": 10, "log": true}. Tuned models appear in the leaderboard as "(tuned)".'));
   return out;
 }
 function datasetSource() {

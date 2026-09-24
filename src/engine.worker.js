@@ -1,7 +1,7 @@
 /* Classic Web Worker that hosts Pyodide + scikit-learn and the ML Agent engine (engine.py). */
 const PYODIDE_VERSION = '0.27.7';
 const INDEX_URL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
-let py = null, engine = null, ready = null;
+let py = null, engine = null, ready = null, optuna = null;
 const post = m => self.postMessage(m);
 const status = (s, message, extra = {}) => post({ type: 'status', status: s, message, ...extra });
 
@@ -29,12 +29,28 @@ async function boot() {
   py.loadPackage(['matplotlib'], { messageCallback: () => {} }).catch(() => {});
 }
 
+// Optuna is pure Python: install it from PyPI with micropip the first time an Optuna search runs.
+async function ensureOptuna() {
+  if (optuna !== null) return optuna;
+  post({ type: 'progress', data: JSON.stringify({ stage: 'prepare', message: 'Installing Optuna (first time only)…' }) });
+  try {
+    await py.loadPackage(['micropip'], { messageCallback: () => {} });
+    await py.pyimport('micropip').install('optuna');
+    optuna = true;
+  } catch (err) {
+    optuna = false;
+    post({ type: 'progress', data: JSON.stringify({ stage: 'log', level: 'warn', message: 'Optuna could not be installed (' + String(err && err.message || err).slice(0, 160) + '); using the built-in Bayesian optimisation.' }) });
+  }
+  return optuna;
+}
+
 self.onmessage = async e => {
   const { id, fn, args } = e.data;
   try {
     ready ||= boot();
     await ready;
     if (fn === '__ping') return post({ type: 'result', id, result: '{}' });
+    if (fn === 'run') { try { const c = JSON.parse(args[0]); if (c.tuning && c.tuning.enabled && c.tuning.method === 'optuna') await ensureOptuna(); } catch { /* engine falls back */ } }
     if (fn === 'run_code') { try { await py.loadPackagesFromImports(args[0] + '\nimport matplotlib'); } catch { /* optional */ } }
     const f = engine[fn];
     if (!f) throw new Error('Unknown engine function ' + fn);

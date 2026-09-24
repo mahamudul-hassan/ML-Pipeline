@@ -3,8 +3,9 @@ import { S, emit } from './store.js';
 import { AI, aiReady, runAgent, runCodeBlock } from './ai.js';
 import { h, md, esc, toast } from './util.js';
 import { icon } from './icons.js';
+import { A } from './actions.js';
 
-const TOOL_LABEL = { get_state: 'Read pipeline state', update_block: 'Update block', add_block: 'Add block', remove_block: 'Remove block', run_pipeline: 'Run pipeline', get_leaderboard: 'Read leaderboard', get_model_details: 'Read model details', predict: 'Predict', what_if: 'What-if analysis', explain_model: 'Explain model', run_python: 'Run Python', show_in_dashboard: 'Open dashboard', get_test_rows: 'Read test rows', export: 'Export' };
+const TOOL_LABEL = { diagnose: 'Pipeline Doctor', apply_fixes: 'Apply fixes', retrain_models: 'Retrain models', list_code_cells: 'Read code cells', write_code_cell: 'Write & run code cell', get_state: 'Read pipeline state', update_block: 'Update block', add_block: 'Add block', remove_block: 'Remove block', run_pipeline: 'Run pipeline', get_leaderboard: 'Read leaderboard', get_model_details: 'Read model details', predict: 'Predict', what_if: 'What-if analysis', explain_model: 'Explain model', run_python: 'Run Python', show_in_dashboard: 'Open dashboard', get_test_rows: 'Read test rows', export: 'Export' };
 
 export function newThread() { return { items: [], api: [] }; }
 
@@ -18,7 +19,7 @@ function argSummary(t) {
   if (t.name === 'export') return a.what;
   return '';
 }
-function pythonOutput(r) {
+export function pythonOutput(r) {
   const box = h('div', {});
   if (!r) return box;
   if (r.stdout) box.append(h('pre', {}, r.stdout));
@@ -28,25 +29,28 @@ function pythonOutput(r) {
     box.append(h('div', { class: 'scrollx' }, h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, ''), t.columns.map(c => h('th', {}, c))), t.rows.slice(0, 30).map((row, i) => h('tr', {}, h('td', { class: 'muted' }, t.index[i]), row.map(v => h('td', {}, v == null ? '' : typeof v === 'number' ? +v.toFixed(5) : String(v))))))));
   }
   for (const f of r.figures || []) box.append(h('img', { src: 'data:image/png;base64,' + f, alt: 'Figure from Python code' }));
-  if (r.exception) box.append(h('pre', { class: 'err' }, r.exception));
+  if (r.error_info) box.append(h('div', { class: 'note warn' }, h('b', {}, `${r.error_info.type}${r.error_info.line ? ` on line ${r.error_info.line}` : ''}: `), r.error_info.message, r.error_info.code_line ? h('pre', { style: 'margin:6px 0' }, r.error_info.code_line) : null, h('div', { class: 'xs' }, 'Hint: ' + r.error_info.hint)));
+  if (r.exception) box.append(h('details', {}, h('summary', { class: 'xs muted' }, 'Full traceback'), h('pre', { class: 'err' }, r.exception)));
+  if (r.warnings?.length) box.append(h('div', { class: 'note' }, h('b', {}, 'Review: '), r.warnings.join(' ')));
   if (r.error) box.append(h('pre', { class: 'err' }, r.error));
   if (r.results_changed) box.append(h('div', { class: 'xs okc' }, 'Leaderboard and dashboard updated.'));
   return box;
 }
 function toolCard(t, rerender) {
   const st = { running: 'running…', done: 'done', error: 'error', awaiting: 'needs approval', denied: 'not approved' }[t.status] || t.status;
-  const d = h('details', { class: 'tool ' + (t.status === 'awaiting' ? 'pending' : t.status), open: t.status === 'awaiting' || (t.name === 'run_python' && t.status !== 'denied') || t.status === 'error' },
-    h('summary', {}, h('span', { html: icon(t.name === 'run_python' ? 'code' : t.name === 'run_pipeline' ? 'play' : 'wand', 14) }), `${TOOL_LABEL[t.name] || t.name}`, h('span', { class: 'muted', style: 'font-weight:500' }, argSummary(t)), h('span', { class: 'sp' }), h('span', { class: 'xs muted' }, st)));
+  const d = h('details', { class: 'tool ' + (t.status === 'awaiting' ? 'pending' : t.status), open: t.status === 'awaiting' || (['run_python', 'write_code_cell', 'diagnose'].includes(t.name) && t.status !== 'denied') || t.status === 'error' },
+    h('summary', {}, h('span', { html: icon(['run_python', 'write_code_cell'].includes(t.name) ? 'code' : t.name === 'run_pipeline' || t.name === 'retrain_models' ? 'play' : t.name === 'diagnose' ? 'alert' : 'wand', 14) }), `${TOOL_LABEL[t.name] || t.name}`, h('span', { class: 'muted', style: 'font-weight:500' }, argSummary(t)), h('span', { class: 'sp' }), h('span', { class: 'xs muted' }, st)));
   const body = h('div', { class: 'tb' });
-  if (t.name === 'run_python') body.append(h('pre', {}, t.args.code || ''));
+  if (t.name === 'run_python' || t.name === 'write_code_cell') body.append(h('pre', {}, (t.args.cell_id ? `# cell ${t.args.cell_id}\n` : '') + (t.args.code || '')));
   else if (Object.keys(t.args || {}).length) body.append(h('pre', {}, JSON.stringify(t.args, null, 1).slice(0, 1500)));
   if (t.status === 'awaiting') {
-    body.append(h('div', { class: 'approve' }, t.name === 'run_python' ? 'Run this code in the Python engine?' : t.name === 'run_pipeline' ? 'Train all models now?' : 'Apply this change to the pipeline?',
+    body.append(h('div', { class: 'approve' }, ['run_python', 'write_code_cell'].includes(t.name) ? 'Run this code in the Python engine?' : t.name === 'run_pipeline' ? 'Train all models now?' : t.name === 'retrain_models' ? 'Retrain these models now?' : 'Apply this change to the pipeline?',
       h('div', { class: 'mact' }, h('button', { class: 'btn sm primary', onclick: () => t.resolve && t.resolve(true) }, 'Allow'), h('button', { class: 'btn sm', onclick: () => t.resolve && t.resolve(false) }, 'Deny'),
         h('label', { class: 'chk xs', style: 'margin:0 0 0 6px' }, h('input', { type: 'checkbox', onchange: e => { if (e.target.checked) { AI.confirm = false; emit('ai-settings'); t.resolve && t.resolve(true); } } }), 'Always allow'))));
   }
   if (t.result) {
-    if (t.name === 'run_python') body.append(pythonOutput(t.result));
+    if (t.name === 'run_python' || t.name === 'write_code_cell') body.append(pythonOutput(t.result));
+    else if (t.name === 'diagnose' && t.result.issues) body.append(h('ul', { class: 'insights' }, t.result.issues.slice(0, 12).map(i => h('li', {}, h('b', { class: i.severity === 'error' ? 'err' : i.severity === 'warning' ? 'warnc' : 'muted' }, i.severity + ' '), i.title))));
     else if (t.result.error) body.append(h('pre', { class: 'err' }, t.result.error));
     else if (t.name !== 'get_state') body.append(h('pre', {}, JSON.stringify(t.result, (k, v) => (typeof v === 'number' ? Math.round(v * 1e4) / 1e4 : v), 1).slice(0, 2500)));
   }
@@ -116,7 +120,10 @@ export class ChatView {
       const out = h('div', {});
       const btn = h('button', { class: 'btn sm', html: icon('play', 11) + ' Run in engine', onclick: async () => {
         btn.disabled = true; out.innerHTML = '<div class="xs muted">Running…</div>';
-        try { const r = await runCodeBlock(pre.textContent); out.innerHTML = ''; out.append(pythonOutput(r)); } catch (e) { out.innerHTML = `<pre class="err">${esc(e.message)}</pre>`; }
+        try {
+          const r = await runCodeBlock(pre.textContent); out.innerHTML = ''; out.append(pythonOutput(r));
+          if (r.exception || r.warnings?.length) out.append(h('div', { class: 'mact' }, h('button', { class: 'btn sm violet', html: icon('wand', 12) + ' Fix with AI', onclick: () => A.fixWithAI('code', { code: pre.textContent, error: r.error_info ? `${r.error_info.type} on line ${r.error_info.line}: ${r.error_info.message}` : r.warnings.join(' ') }) })));
+        } catch (e) { out.innerHTML = `<pre class="err">${esc(e.message)}</pre>`; }
         btn.disabled = false;
       } });
       pre.after(h('div', { class: 'mact' }, btn), out);

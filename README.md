@@ -12,7 +12,7 @@ It is a static site with two tiny serverless functions, so it deploys to Vercel 
 - **Feature engineering:** custom pandas expressions, date parts, polynomial and interaction features, splines, binning.
 - **Feature selection:** variance filter, correlation filter, SelectKBest (F-test, mutual information, chi²), SelectPercentile, RFE, RFECV, L1-based and tree-importance SelectFromModel, sequential forward and backward selection. Reduction with PCA, Truncated SVD, FastICA, Kernel PCA or LDA.
 - **Validation:** train / validation / test split (stratified or time-ordered). K-fold, stratified, repeated, shuffle, time-series and group K-fold CV. Models are ranked by CV score, and the test set is kept for the final report.
-- **Tuning:** grid, random, halving-grid and halving-random search, with per-model search spaces.
+- **Tuning:** **Optuna Bayesian optimisation** (TPE, random or quasi-Monte-Carlo sampler, optional time limit), a built-in Gaussian-process Bayesian optimiser (used automatically if Optuna cannot be installed), grid, random, halving-grid and halving-random search. Per-model search spaces accept lists or ranges such as `{"low": 0.01, "high": 10, "log": true}`. The dashboard shows the optimisation history, hyperparameter importance, parallel coordinates and every trial.
 - **Dashboard for every model:**
   - Overview with KPIs and insights.
   - Sortable leaderboard across all metrics and splits.
@@ -100,7 +100,7 @@ tests/                  engine tests (native Python) and an end-to-end UI test
 ## Tests
 
 ```bash
-pip install scikit-learn pandas scipy xgboost lightgbm matplotlib joblib
+pip install scikit-learn pandas scipy xgboost lightgbm matplotlib joblib optuna
 python3 tests/test_engine.py        # every model, every preprocessing / selection / CV option
 node tests/ui_test.mjs              # needs jsdom (npm i jsdom); real engine + mocked Ollama
 ```
@@ -112,6 +112,8 @@ node tests/ui_test.mjs              # needs jsdom (npm i jsdom); real engine + m
 - For big data, export the project and run `train.py` natively; it uses the same engine and gives the same results.
 - **Stop** terminates the Python worker and restarts it, so models trained in that session are cleared.
 - `model.joblib` is pickled with the browser's scikit-learn version (pinned in `requirements.txt`).
+- Optuna is installed from PyPI with micropip the first time an Optuna search runs (a few MB, then cached).
+- The XGBoost bundled with Pyodide (2.1.2) predates scikit-learn 1.6's estimator tags; `engine.fix_sklearn_tags` patches it at load time, so XGBoost works on its own and inside voting / stacking ensembles.
 - SHAP values are computed with a model-agnostic permutation estimator on the original columns, so they are approximations.
 
 ## License

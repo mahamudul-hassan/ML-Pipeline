@@ -35,7 +35,7 @@ from sklearn.compose import ColumnTransformer  # noqa: E402
 from sklearn.decomposition import PCA, FastICA, KernelPCA, TruncatedSVD  # noqa: E402
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis  # noqa: E402
 from sklearn.ensemble import (  # noqa: E402
-    ExtraTreesClassifier, ExtraTreesRegressor, IsolationForest,
+    RandomForestRegressor, ExtraTreesClassifier, ExtraTreesRegressor, IsolationForest,
     StackingClassifier, StackingRegressor, VotingClassifier, VotingRegressor,
 )
 from sklearn.experimental import enable_halving_search_cv  # noqa: E402,F401
@@ -48,7 +48,7 @@ from sklearn.impute import IterativeImputer, KNNImputer, SimpleImputer  # noqa: 
 from sklearn.inspection import permutation_importance  # noqa: E402
 from sklearn.linear_model import Lasso, LogisticRegression, Ridge, RidgeCV  # noqa: E402
 from sklearn.model_selection import (  # noqa: E402
-    GridSearchCV, GroupKFold, HalvingGridSearchCV, HalvingRandomSearchCV, KFold, RandomizedSearchCV,
+    cross_val_score, GridSearchCV, GroupKFold, HalvingGridSearchCV, HalvingRandomSearchCV, KFold, RandomizedSearchCV,
     RepeatedKFold, RepeatedStratifiedKFold, ShuffleSplit, StratifiedKFold, StratifiedShuffleSplit,
     TimeSeriesSplit, cross_validate, learning_curve, train_test_split,
 )
@@ -830,11 +830,56 @@ def _convert_param(v):
     return v
 
 
+_TAGS_CHECKED = set()
+
+
+def _compat_tags(self):
+    from sklearn.base import RegressorMixin
+    from sklearn.utils import ClassifierTags, RegressorTags
+    tags = BaseEstimator.__sklearn_tags__(self)
+    if isinstance(self, ClassifierMixin):
+        tags.estimator_type, tags.classifier_tags = "classifier", ClassifierTags()
+        tags.target_tags.required = True
+    elif isinstance(self, RegressorMixin):
+        tags.estimator_type, tags.regressor_tags = "regressor", RegressorTags()
+        tags.target_tags.required = True
+    return tags
+
+
+def fix_sklearn_tags(Est):
+    """XGBoost < 2.1.4 (bundled with Pyodide 0.27) is incompatible with scikit-learn 1.6's estimator tags:
+    it keeps the old `_more_tags` and lists sklearn's mixins after BaseEstimator, so tag lookup fails with
+    "'super' object has no attribute '__sklearn_tags__'". Giving every class in its MRO that defines
+    `_more_tags` a direct `__sklearn_tags__` makes scikit-learn use the modern, working code path."""
+    if Est in _TAGS_CHECKED:
+        return Est
+    _TAGS_CHECKED.add(Est)
+    try:
+        from sklearn.utils import get_tags
+    except ImportError:  # scikit-learn < 1.6 has no new tags, nothing to fix
+        return Est
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            get_tags(Est())
+        return Est
+    except AttributeError:
+        pass
+    except Exception:
+        return Est
+    for klass in Est.__mro__:
+        if "_more_tags" in vars(klass) and "__sklearn_tags__" not in vars(klass):
+            klass.__sklearn_tags__ = _compat_tags
+    if "__sklearn_tags__" not in vars(Est):
+        Est.__sklearn_tags__ = _compat_tags
+    return Est
+
+
 def make_estimator(spec, task, seed, overrides=None):
     path = spec["cls"][task] if isinstance(spec["cls"], dict) else spec["cls"]
     mod, name = path.split(":")
     try:
-        Est = getattr(importlib.import_module(mod), name)
+        Est = fix_sklearn_tags(getattr(importlib.import_module(mod), name))
     except (ImportError, AttributeError) as e:
         raise RuntimeError(f"{spec.get('name', name)} needs the '{mod.split('.')[0]}' package, which is not available: {e}")
     valid = Est().get_params(deep=False)
@@ -1311,6 +1356,128 @@ def _ensemble_factory(ens, members, cfg, task, K):
     return lambda: (StackingClassifier if cls else StackingRegressor)([(n, clone(e)) for n, e in ests], final_estimator=clone(final), cv=int(ens.get("params", {}).get("cv", 3)), n_jobs=N_JOBS)
 
 
+def _dims(raw, meta):
+    """Turn a search space (lists or {low, high, log, type} ranges) into dimensions for Bayesian search."""
+    dims = []
+    for k, vals in raw.items():
+        mm = (meta or {}).get(k) or {}
+        if isinstance(vals, dict):
+            lo, hi = float(vals.get("low", vals.get("min", 0))), float(vals.get("high", vals.get("max", 1)))
+            kind = "int" if vals.get("type") == "int" else "float"
+            dims.append({"k": k, "kind": kind, "lo": lo, "hi": hi, "log": bool(vals.get("log")) and lo > 0})
+            continue
+        nums = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if not mm.get("cat") and len(nums) == len(vals) and len(set(nums)) >= 2:
+            lo, hi = min(nums), max(nums)
+            dims.append({"k": k, "kind": "int" if all(isinstance(v, int) for v in nums) else "float", "lo": lo, "hi": hi,
+                         "log": bool(lo > 0 and (mm.get("log") or hi / lo >= 50))})
+        else:
+            dims.append({"k": k, "kind": "cat", "choices": list(vals)})
+    return dims
+
+
+def _label(v):
+    return "None" if v is None else ",".join(map(str, v)) if isinstance(v, (list, tuple)) else str(v)
+
+
+def _search_optuna(dims, evaluate, n, timeout, seed, sampler_name, report):
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    if sampler_name == "random":
+        sampler = optuna.samplers.RandomSampler(seed=seed)
+    elif sampler_name == "qmc":
+        sampler = optuna.samplers.QMCSampler(seed=seed, warn_independent_sampling=False)
+    else:
+        sampler = optuna.samplers.TPESampler(seed=seed, n_startup_trials=min(5, max(2, n // 4)), multivariate=True, warn_independent_sampling=False)
+    study = optuna.create_study(direction="maximize", sampler=sampler)
+    labels = {d["k"]: {} for d in dims if d["kind"] == "cat"}
+    for d in dims:
+        if d["kind"] == "cat":
+            for j, c in enumerate(d["choices"]):
+                lab = _label(c)
+                labels[d["k"]][lab if lab not in labels[d["k"]] else f"{lab}#{j}"] = c
+    out = []
+
+    def objective(trial):
+        params = {}
+        for d in dims:
+            if d["kind"] == "cat":
+                params[d["k"]] = labels[d["k"]][trial.suggest_categorical(d["k"], list(labels[d["k"]]))]
+            elif d["kind"] == "int":
+                params[d["k"]] = trial.suggest_int(d["k"], int(d["lo"]), int(d["hi"]), log=d["log"])
+            else:
+                params[d["k"]] = trial.suggest_float(d["k"], float(d["lo"]), float(d["hi"]), log=d["log"])
+        rec = evaluate(params)
+        out.append(rec)
+        report(len(out))
+        return rec["score_raw"] if rec["score_raw"] is not None else -1e12
+
+    study.optimize(objective, n_trials=n, timeout=timeout or None, catch=(Exception,))
+    return out
+
+
+def _search_gp(dims, evaluate, n, timeout, seed, report):
+    """Built-in Bayesian optimisation: Gaussian-process surrogate + expected improvement."""
+    from scipy.stats import norm
+    from sklearn.gaussian_process import GaussianProcessRegressor
+    from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
+    rng = np.random.RandomState(seed)
+    nd = len(dims)
+
+    def decode(u):
+        params = {}
+        for j, d in enumerate(dims):
+            x = float(u[j])
+            if d["kind"] == "cat":
+                params[d["k"]] = d["choices"][min(len(d["choices"]) - 1, int(x * len(d["choices"])))]
+            else:
+                v = math.exp(math.log(d["lo"]) + x * (math.log(d["hi"]) - math.log(d["lo"]))) if d["log"] else d["lo"] + x * (d["hi"] - d["lo"])
+                params[d["k"]] = int(round(v)) if d["kind"] == "int" else float(v)
+        return params
+
+    U, Y, out = [], [], []
+    n_init = min(n, max(3, min(6, n // 3)))
+    t0 = time.time()
+    for it in range(n):
+        if timeout and time.time() - t0 > timeout:
+            break
+        if it < n_init or len(Y) < 3:
+            u = rng.rand(nd)
+        else:
+            gp = GaussianProcessRegressor(kernel=ConstantKernel(1.0) * Matern(length_scale=np.full(nd, 0.3), length_scale_bounds=(1e-2, 10), nu=2.5) + WhiteKernel(1e-3, (1e-6, 1e-1)),
+                                          normalize_y=True, random_state=seed, n_restarts_optimizer=2)
+            gp.fit(np.array(U), np.array(Y))
+            cand = rng.rand(2000, nd)
+            mu, sd = gp.predict(cand, return_std=True)
+            imp = mu - max(Y) - 0.01 * (np.std(Y) or 1e-3)
+            z = imp / np.maximum(sd, 1e-9)
+            u = cand[int(np.argmax(imp * norm.cdf(z) + sd * norm.pdf(z)))]
+        rec = evaluate(decode(u))
+        out.append(rec)
+        U.append(u)
+        Y.append(rec["score_raw"] if rec["score_raw"] is not None else (min(Y) if Y else 0) - 1)
+        report(len(out))
+    return out
+
+
+def _param_importance(trials, keys):
+    ok = [t for t in trials if t["score_raw"] is not None]
+    if len(ok) < 6 or not keys:
+        return None
+    cols = []
+    for k in keys:
+        vals = [t["params"].get(k) for t in ok]
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vals):
+            cols.append(np.array(vals, float))
+        else:
+            cols.append(pd.Categorical([_label(v) for v in vals]).codes.astype(float))
+    y = np.array([t["score_raw"] for t in ok])
+    if np.std(y) == 0:
+        return None
+    rf = RandomForestRegressor(n_estimators=200, random_state=0, n_jobs=N_JOBS).fit(np.column_stack(cols), y)
+    return sorted(({"param": k, "importance": float(v)} for k, v in zip(keys, rf.feature_importances_)), key=lambda x: -x["importance"])
+
+
 def tune_models(cfg, T, specs, D):
     results, primary, task, K = S["results"], D["primary"], D["task"], D["K"]
     ranked = [r for r in _ranked(results, primary) if not r.get("ensemble") and not r.get("tuned_from")]
@@ -1321,11 +1488,13 @@ def tune_models(cfg, T, specs, D):
         n = {"best": 1, "top3": 3, "top5": 5, "all": len(ranked)}.get(which, 1)
         ids = [r["id"] for r in ranked[:n]]
     spec_by = {s["id"]: s for s in specs}
-    method = T.get("method", "random")
-    n_iter = int(T.get("n_iter", 15))
+    method = T.get("method", "optuna")
+    n_iter = int(T.get("n_iter", 20))
     folds = int(T.get("cv_folds", 3))
+    seed = int(cfg["split"].get("seed", 42))
     cv = make_cv(cfg, task, D["y_train"], D["g_train"], folds=folds) or KFold(folds, shuffle=True, random_state=0)
     sc = D["scorers"][primary]
+    sign = -1 if primary in LOWER_BETTER else 1
     grids = T.get("grids") or {}
     for i, mid in enumerate(ids):
         spec = spec_by.get(mid)
@@ -1337,58 +1506,110 @@ def tune_models(cfg, T, specs, D):
         base = build_pipeline(cfg, spec, task, K)
         prefix = "model__estimator__" if isinstance(base.steps[-1][1], ResampledClassifier) else "model__"
         valid = base.steps[-1][1].get_params(deep=True) if prefix == "model__" else base.steps[-1][1].estimator.get_params()
-        g = {prefix + k: [_convert_param(v) for v in vals] for k, vals in grid.items() if k in valid and isinstance(vals, list) and vals}
-        if not g:
+        raw = {k: v for k, v in grid.items() if k in valid and ((isinstance(v, list) and v) or (isinstance(v, dict) and ("low" in v or "min" in v)))}
+        if not raw:
             log(f"The search space for {spec['name']} has no valid parameters; skipped.", "warn")
             continue
-        combos = int(np.prod([len(v) for v in g.values()]))
         Xtr, ytr, gtr = _fit_rows(spec, D["X_train"], D["y_train"], cfg, D["g_train"])
         m = method
-        if m == "grid" and combos > int(T.get("max_grid", 60)):
-            log(f"The grid for {spec['name']} has {combos} combinations; using random search with {n_iter} instead.", "warn")
-            m = "random"
+        note = None
         t0 = time.time()
+
+        def evaluate(params):
+            pipe = clone(base).set_params(**{prefix + k: _convert_param(v) for k, v in params.items()})
+            ts = time.time()
+            s = cross_val_score(pipe, Xtr, ytr, cv=cv, groups=gtr, scoring=sc, error_score=np.nan, n_jobs=N_JOBS)
+            ok = not np.all(np.isnan(s))
+            mean = float(np.nanmean(s)) if ok else None
+            return {"params": {k: (list(v) if isinstance(v, tuple) else v) for k, v in params.items()}, "raw": params, "score_raw": mean,
+                    "mean": None if mean is None else sign * mean, "std": float(np.nanstd(s)) if ok else None, "folds": list(sign * s),
+                    "fit_time": (time.time() - ts) / max(1, len(s))}
+
+        def report(k, total=n_iter, name=spec["name"], idx=i):
+            progress("tune", f"Tuning {name}: trial {k}/{total}", idx + 1, len(ids), model=mid)
+
         try:
-            if m == "grid":
-                search = GridSearchCV(base, g, scoring=sc, cv=cv, n_jobs=N_JOBS, error_score=np.nan)
-            elif m == "halving_grid":
-                search = HalvingGridSearchCV(base, g, scoring=sc, cv=cv, factor=3, random_state=0, n_jobs=N_JOBS, error_score=np.nan)
-            elif m == "halving_random":
-                search = HalvingRandomSearchCV(base, g, scoring=sc, cv=cv, factor=3, random_state=0, n_jobs=N_JOBS, error_score=np.nan)
+            if m == "optuna":
+                try:
+                    import optuna  # noqa: F401
+                except ImportError:
+                    m, note = "bayesian", "Optuna is not installed here, so the built-in Gaussian-process Bayesian optimisation was used."
+                    log(note, "warn")
+            if m == "optuna":
+                trials = _search_optuna(_dims(raw, spec.get("space")), evaluate, n_iter, float(T.get("timeout", 0) or 0), seed, T.get("sampler", "tpe"), report)
+            elif m == "bayesian":
+                trials = _search_gp(_dims(raw, spec.get("space")), evaluate, n_iter, float(T.get("timeout", 0) or 0), seed, report)
             else:
-                search = RandomizedSearchCV(base, g, n_iter=min(n_iter, combos), scoring=sc, cv=cv, random_state=0, n_jobs=N_JOBS, error_score=np.nan)
-            search.fit(Xtr, ytr, **({"groups": gtr} if gtr is not None else {}))
+                g = {prefix + k: [_convert_param(v) for v in vals] for k, vals in raw.items() if isinstance(vals, list)}
+                if len(g) < len(raw):
+                    log(f"Ranges like {{low, high}} need Optuna or Bayesian search; {spec['name']} uses only the list parameters.", "warn")
+                combos = int(np.prod([len(v) for v in g.values()]))
+                if m == "grid" and combos > int(T.get("max_grid", 60)):
+                    log(f"The grid for {spec['name']} has {combos} combinations; using random search with {n_iter} instead.", "warn")
+                    m = "random"
+                if m == "grid":
+                    search = GridSearchCV(base, g, scoring=sc, cv=cv, n_jobs=N_JOBS, error_score=np.nan)
+                elif m == "halving_grid":
+                    search = HalvingGridSearchCV(base, g, scoring=sc, cv=cv, factor=3, random_state=0, n_jobs=N_JOBS, error_score=np.nan)
+                elif m == "halving_random":
+                    search = HalvingRandomSearchCV(base, g, scoring=sc, cv=cv, factor=3, random_state=0, n_jobs=N_JOBS, error_score=np.nan)
+                else:
+                    search = RandomizedSearchCV(base, g, n_iter=min(n_iter, combos), scoring=sc, cv=cv, random_state=0, n_jobs=N_JOBS, error_score=np.nan)
+                search.fit(Xtr, ytr, **({"groups": gtr} if gtr is not None else {}))
+                cvr = search.cv_results_
+                nsplit = sum(1 for k in cvr if k.startswith("split") and k.endswith("_test_score"))
+                trials = []
+                for j in range(len(cvr["params"])):
+                    params = {k.replace(prefix, ""): v for k, v in cvr["params"][j].items()}
+                    mean = cvr["mean_test_score"][j]
+                    ok = np.isfinite(mean)
+                    trials.append({"params": {k: (list(v) if isinstance(v, tuple) else v) for k, v in params.items()}, "raw": params,
+                                   "score_raw": float(mean) if ok else None, "mean": sign * float(mean) if ok else None, "std": float(cvr["std_test_score"][j]) if ok else None,
+                                   "folds": [sign * cvr[f"split{s}_test_score"][j] for s in range(nsplit)], "fit_time": float(cvr["mean_fit_time"][j])})
         except Exception as e:  # noqa: BLE001
-            log(f"Tuning {spec['name']} failed: {e}", "error")
+            log(f"Tuning {spec['name']} failed: {type(e).__name__}: {e}", "error")
             continue
-        cvr = search.cv_results_
-        sign = -1 if primary in LOWER_BETTER else 1
-        trials = []
-        for j in range(len(cvr["params"])):
-            trials.append({"params": {k.replace(prefix, ""): (list(v) if isinstance(v, tuple) else v) for k, v in cvr["params"][j].items()},
-                           "mean": sign * cvr["mean_test_score"][j], "std": cvr["std_test_score"][j], "rank": int(cvr["rank_test_score"][j]),
-                           "fit_time": cvr["mean_fit_time"][j]})
-        trials.sort(key=lambda t: t["rank"])
-        bi = search.best_index_
-        nsplit = sum(1 for k in cvr if k.startswith("split") and k.endswith("_test_score"))
-        folds_scores = np.array([cvr[f"split{s}_test_score"][bi] for s in range(nsplit)]) * sign
-        best_params = {k.replace(prefix, ""): v for k, v in search.best_params_.items()}
+        good = [t for t in trials if t["score_raw"] is not None]
+        if not good:
+            log(f"Every tuning trial for {spec['name']} failed.", "error")
+            continue
+        for j, t in enumerate(trials):
+            t["number"] = j
+        order = sorted(trials, key=lambda t: -t["score_raw"] if t["score_raw"] is not None else math.inf)
+        for rank, t in enumerate(order, 1):
+            t["rank"] = rank
+        best_t = order[0]
+        history, best_raw = [], -math.inf
+        for t in trials:
+            if t["score_raw"] is not None:
+                best_raw = max(best_raw, t["score_raw"])
+            history.append({"number": t["number"], "value": t["mean"], "best": sign * best_raw if best_raw > -math.inf else None})
+        keys = list(raw)
+        importance = _param_importance(trials, keys)
+        folds_scores = np.array(best_t["folds"], float)
+        best_params = best_t["raw"]
         tid = f"{mid}__tuned"
         merged = {**(spec.get("params") or {}), **{k: (list(v) if isinstance(v, tuple) else v) for k, v in best_params.items()}}
         tspec = {**spec, "id": tid, "params": merged}
         try:
             r, pipe = train_one(tid, f"{spec['name']} (tuned)", spec["key"], lambda ts=tspec: build_pipeline(cfg, ts, task, K), cfg, D,
-                                cv_override={primary: {"mean": folds_scores.mean(), "std": folds_scores.std(), "folds": folds_scores}}, family=spec.get("family", ""), params=merged, spec=tspec)
+                                cv_override={primary: {"mean": float(np.nanmean(folds_scores)), "std": float(np.nanstd(folds_scores)), "folds": folds_scores}},
+                                family=spec.get("family", ""), params=merged, spec=tspec)
         except Exception as e:  # noqa: BLE001
             log(f"Refitting tuned {spec['name']} failed: {e}", "error")
             continue
         r["tuned_from"] = mid
-        r["tuning"] = {"method": m, "trials": trials[:100], "n_trials": len(trials), "best_params": best_params, "time": time.time() - t0,
-                       "before": results[mid].get("score"), "after": r["score"], "folds": nsplit, "grid": {k.replace(prefix, ""): [(list(x) if isinstance(x, tuple) else x) for x in v] for k, v in g.items()}}
+        grid_keys = {k: (v if isinstance(v, dict) else [(list(x) if isinstance(x, tuple) else x) for x in v]) for k, v in raw.items()}
+        r["tuning"] = {"method": m, "sampler": T.get("sampler", "tpe") if m == "optuna" else None, "note": note,
+                       "trials": [{k: t[k] for k in ("number", "params", "mean", "std", "rank", "fit_time")} for t in order[:150]],
+                       "n_trials": len(trials), "n_failed": len(trials) - len(good), "best_params": best_t["params"], "time": time.time() - t0,
+                       "before": results[mid].get("score"), "after": r["score"], "folds": len(folds_scores), "grid": grid_keys,
+                       "history": history, "importance": importance}
         results[tid] = r
         S["models"][tid] = pipe
         spec_by[tid] = tspec
-        log(f"Tuned {spec['name']} with {m} search ({len(trials)} candidates): CV {primary} {_fmt(results[mid].get('score'))} → {_fmt(r['score'])}. Best: {best_params}.")
+        label = {"optuna": "Optuna " + (T.get("sampler", "tpe")).upper(), "bayesian": "Bayesian (GP)"}.get(m, m)
+        log(f"Tuned {spec['name']} with {label} search ({len(trials)} trials): CV {primary} {_fmt(results[mid].get('score'))} → {_fmt(r['score'])}. Best: {best_t['params']}.")
 
 
 def _ranked(results, primary):
@@ -1691,6 +1912,7 @@ def run_code(code):
     except Exception:
         plt = None
     err = None
+    info = None
     try:
         tree = ast.parse(code, mode="exec")
         last = tree.body.pop() if tree.body and isinstance(tree.body[-1], ast.Expr) else None
@@ -1698,8 +1920,9 @@ def run_code(code):
             exec(compile(tree, "<assistant>", "exec"), ns)
             if last is not None:
                 result = eval(compile(ast.Expression(last.value), "<assistant>", "eval"), ns)
-    except Exception:
+    except Exception as e:  # noqa: BLE001
         err = traceback.format_exc(limit=4)[-2500:]
+        info = _explain_exception(e, code, ns)
     if plt is not None:
         for num in plt.get_fignums():
             fig = plt.figure(num)
@@ -1716,7 +1939,70 @@ def run_code(code):
         result_text = f"DataFrame {result.shape[0]}×{result.shape[1]}"
     else:
         result_text = None if result is None else repr(result)[:4000]
-    return dumps({"stdout": buf.getvalue()[-8000:], "result": result_text, "table": table, "figures": figs, "exception": err, "results_changed": bool(S.get("_changed"))})
+    return dumps({"stdout": buf.getvalue()[-8000:], "result": result_text, "table": table, "figures": figs, "exception": err, "error": None,
+                  "error_info": info, "warnings": lint_code(code), "results_changed": bool(S.get("_changed"))})
+
+
+def _explain_exception(e, code, ns):
+    """Locate the failing line and give a concrete hint, so the AI (or user) can fix the code."""
+    tb = traceback.extract_tb(e.__traceback__)
+    line = next((f.lineno for f in reversed(tb) if f.filename == "<assistant>"), None)
+    if isinstance(e, SyntaxError):
+        line = e.lineno
+    lines = code.splitlines()
+    msg = str(e)
+    names = sorted(k for k in ns if not k.startswith("_") and k not in ("__builtins__",))
+    cols = list(S["df"].columns) if S.get("df") is not None else []
+    feats = list(S["frame_spec"]["features"]) if S.get("frame_spec") else []
+    hint = "Read the message and the failing line, fix the root cause and run again."
+    if "NoneType" in msg and "D" not in S:
+        hint = "X_train, y_train, models and results only exist after a pipeline run. Run the pipeline first (or use `df`, the raw data)."
+    elif isinstance(e, NameError):
+        hint = f"That name is not defined. Available names: {', '.join(names[:60])}."
+    elif isinstance(e, KeyError):
+        hint = f"Key {msg} not found. Data columns: {', '.join(cols[:80])}. Model ids: {', '.join(list(S.get('models', {}))[:40])}."
+    elif isinstance(e, (ModuleNotFoundError, ImportError)):
+        hint = "That package is not available in the browser engine. Use numpy, pandas, scipy, scikit-learn, xgboost, lightgbm, matplotlib or optuna."
+    elif isinstance(e, SyntaxError):
+        hint = "Python syntax error: check brackets, quotes, colons and indentation on that line."
+    elif "could not convert string to float" in msg or "dtype('O')" in msg:
+        hint = "Raw data has text columns. Use a fitted pipeline from `models[...]` (it encodes categoricals), or wrap your estimator with register_model() / make_preprocessor()."
+    elif "is not fitted" in msg:
+        hint = "Fit the estimator on X_train, y_train first, or use an already fitted pipeline from `models`."
+    elif "features" in msg and ("expecting" in msg or "has" in msg):
+        hint = f"Feature mismatch. Fitted pipelines in `models` expect the raw input columns: {', '.join(feats[:60])}."
+    elif "Found input variables with inconsistent numbers of samples" in msg:
+        hint = "X and y have different lengths; pair X_train with y_train, X_val with y_val and X_test with y_test."
+    elif "Unknown label type" in msg or "continuous" in msg:
+        hint = "Wrong target type for this estimator: use a classifier for class labels and a regressor for continuous targets."
+    return {"type": type(e).__name__, "message": msg[:600], "line": line, "code_line": lines[line - 1].strip() if line and 0 < line <= len(lines) else None, "hint": hint}
+
+
+LINT_RULES = [
+    (r"\.fit(_transform)?\(\s*X_test", "Fits on the test set. That leaks test data into training; fit on X_train only."),
+    (r"\.fit(_transform)?\([^)]*\by_test\b", "Uses y_test for fitting. The test labels must only be used for the final evaluation."),
+    (r"\.fit(_transform)?\(\s*df\b", "Fits on the full dataset (df) before splitting. Preprocessing learned on all rows leaks information; fit on X_train or use a Pipeline."),
+    (r"\.fit(_transform)?\(\s*X_val", "Fits on the validation set; keep it for model selection only."),
+]
+
+
+def lint_code(code):
+    """Cheap static review for common conceptual ML mistakes in user / AI code."""
+    import re
+    out = []
+    for pat, msg in LINT_RULES:
+        if re.search(pat, code):
+            out.append(msg)
+    task = (S.get("D") or {}).get("task")
+    if task == "regression" and re.search(r"\b(accuracy_score|f1_score|roc_auc_score|confusion_matrix)\b", code):
+        out.append("Uses classification metrics on a regression task.")
+    if task == "classification" and re.search(r"\b(r2_score|mean_squared_error|mean_absolute_error)\b", code):
+        out.append("Uses regression metrics on a classification task.")
+    if re.search(r"\bfor\b[\s\S]*X_test[\s\S]*\b(max|argmax|sort|sorted|best)\b", code) and "X_val" not in code and "cross_val" not in code:
+        out.append("Looks like models are compared or tuned on the test set. Selecting by test score overfits it; use cross-validation on X_train or X_val.")
+    if re.search(r"\.predict\(\s*X_train\s*\)", code) and re.search(r"(score|accuracy|r2|error)", code) and "X_test" not in code and "X_val" not in code:
+        out.append("Evaluates only on training data, which is optimistic; also report X_val / X_test scores.")
+    return out
 
 
 @safe
@@ -1734,6 +2020,257 @@ def frame_csv():
 @safe
 def get_profile():
     return dumps({"profile": profile(S["df"]), "name": S.get("name")})
+
+
+PREP_KEYS = ("dataset", "split", "cv", "preprocess", "fe", "fs", "advanced")
+
+
+@safe
+def retrain_models(config_json, ids_json):
+    """Retrain only some models on the existing splits (fast fix-and-verify loop)."""
+    if "D" not in S:
+        raise ValueError("Run the full pipeline first.")
+    cfg, ids = json.loads(config_json), json.loads(ids_json)
+    old = S["cfg"]
+    changed = [k for k in PREP_KEYS if json.dumps(old.get(k), sort_keys=True) != json.dumps(cfg.get(k), sort_keys=True)]
+    if changed:
+        raise ValueError(f"These settings changed since the last run: {', '.join(changed)}. Run the full pipeline instead.")
+    D, results = S["D"], S["results"]
+    specs = {s["id"]: s for s in cfg.get("models") or []}
+    S["cfg"] = {**old, "models": cfg.get("models"), "eval": cfg.get("eval", old.get("eval"))}
+    report = []
+    for mid in ids:
+        spec = specs.get(mid)
+        if not spec:
+            report.append({"id": mid, "status": "error", "error": "No such model in the current pipeline."})
+            continue
+        if D["task"] not in (spec.get("tasks") or [D["task"]]):
+            report.append({"id": mid, "status": "error", "error": f"{spec['name']} does not support {D['task']}."})
+            continue
+        progress("model", f"Retraining {spec['name']}", ids.index(mid) + 1, len(ids), model=mid)
+        try:
+            r, pipe = train_one(mid, spec["name"], spec["key"], lambda s=spec: build_pipeline(S["cfg"], s, D["task"], D["K"]), S["cfg"], D, family=spec.get("family", ""), params=spec.get("params"), spec=spec)
+            results[mid] = r
+            S["models"][mid] = pipe
+            if (S["cfg"].get("eval") or {}).get("permutation", "none") != "none":
+                try:
+                    r["permutation"] = _permutation(mid, 3)
+                except Exception:
+                    pass
+            report.append({"id": mid, "name": spec["name"], "status": "ok", "score": r["score"], "test": r["test"].get(D["primary"])})
+            log(f"Retrained {spec['name']}: {D['primary']} {_fmt(r['score'])}.")
+        except Exception as e:  # noqa: BLE001
+            results[mid] = {"id": mid, "name": spec["name"], "key": spec["key"], "family": spec.get("family", ""), "status": "error", "error": f"{type(e).__name__}: {e}"}
+            report.append({"id": mid, "name": spec["name"], "status": "error", "error": f"{type(e).__name__}: {e}"})
+            log(f"Retraining {spec['name']} failed: {e}", "error")
+    ranked = _ranked(results, D["primary"])
+    if ranked:
+        S["best"] = ranked[0]["id"]
+    out = summary()
+    out["retrained"] = report
+    return dumps(out)
+
+
+# ------------------------------------------------------------ pipeline doctor
+SCALE_SENSITIVE = {"knn", "svc", "nusvc", "linear_svc", "svr", "nusvr", "linear_svr", "mlp", "logreg", "sgd_clf", "sgd_reg", "perceptron", "pa_clf", "pa_reg",
+                   "kernel_ridge", "gp_clf", "gp_reg", "ridge_clf", "ridge", "lasso", "elasticnet", "huber", "nearest_centroid", "lda", "qda"}
+OVERFIT_FIX = {"rf": {"min_samples_leaf": 5, "max_depth": 12}, "et": {"min_samples_leaf": 5, "max_depth": 12}, "dt": {"max_depth": 6, "min_samples_leaf": 10},
+               "extra_tree": {"max_depth": 6, "min_samples_leaf": 10}, "gb": {"learning_rate": 0.05, "max_depth": 2, "subsample": 0.8},
+               "hgb": {"learning_rate": 0.05, "max_leaf_nodes": 15, "l2_regularization": 1.0}, "xgb": {"max_depth": 3, "learning_rate": 0.05, "subsample": 0.8, "colsample_bytree": 0.8, "reg_lambda": 5},
+               "lgbm": {"num_leaves": 15, "learning_rate": 0.03, "min_child_samples": 40, "reg_lambda": 5}, "mlp": {"alpha": 0.01, "early_stopping": True},
+               "knn": {"n_neighbors": 15}, "svc": {"C": 0.3}, "svr": {"C": 0.3}, "logreg": {"C": 0.3}, "bagging": {"max_samples": 0.7}, "adaboost": {"learning_rate": 0.1}}
+CLS_ONLY_METRICS = {"accuracy", "balanced_accuracy", "f1", "f1_weighted", "precision", "recall", "roc_auc", "average_precision", "mcc", "log_loss"}
+REG_ONLY_METRICS = {"r2", "rmse", "mae", "mape", "medae", "explained_variance"}
+
+
+def _error_hint(msg):
+    m = msg.lower()
+    if "not available" in m or "needs the" in m:
+        return "The library did not load in this engine. Remove the block or use Hist Gradient Boosting instead."
+    if "nan" in m and ("input" in m or "contain" in m):
+        return "The model received missing values. Choose an imputation strategy in Preprocessing."
+    if "negative" in m:
+        return "This model needs non-negative inputs. Use MinMax scaling or another model."
+    if "solver" in m or "penalty" in m:
+        return "Incompatible solver/penalty. Use solver lbfgs with the l2 penalty, or saga for l1/elasticnet."
+    if "n_neighbors" in m or "n_samples_fit" in m:
+        return "n_neighbors is larger than the number of training rows; lower it."
+    if "least populated class" in m or "only one class" in m or "n_splits" in m:
+        return "A class is too small for this split / CV setting. Use fewer folds or disable stratification."
+    if "converge" in m:
+        return "The optimiser did not converge. Increase max_iter or scale the features."
+    if "memory" in m:
+        return "Out of memory. Lower the training rows in Settings or use a lighter model."
+    if "__sklearn_tags__" in m:
+        return "Library version clash (patched automatically); retrain the model."
+    return "Read the error, change the hyperparameters in the model block and retrain it."
+
+
+@safe
+def diagnose(config_json):
+    """Check the pipeline for code-level and conceptual ML problems. Every issue can carry machine-applicable fixes."""
+    cfg = json.loads(config_json)
+    issues = []
+
+    def add(sev, code, title, detail, fix=None, model=None):
+        issues.append({"id": f"{code}{'_' + str(model) if model else ''}", "severity": sev, "code": code, "title": title, "detail": detail, "fix": fix, "model": model})
+
+    df = S.get("df")
+    if df is None:
+        add("error", "no_data", "No dataset loaded", "Upload a file or load a sample dataset.")
+        return dumps({"issues": issues})
+    D = cfg.get("dataset") or {}
+    target = D.get("target")
+    if not target or target not in df.columns:
+        add("error", "no_target", "Target column is missing", f"Choose a target in the Dataset block. Columns: {', '.join(map(str, df.columns[:30]))}.", [{"block": "dataset", "settings": {"target": profile(df)["target_guess"]}}])
+        return dumps({"issues": issues})
+    n = len(df)
+    y = df[target]
+    exclude = set(D.get("exclude") or [])
+    feats = [c for c in df.columns if c != target and c not in exclude and c != D.get("group_col")]
+    ykind = col_kind(y)
+    yv = pd.to_numeric(y, errors="coerce")
+    nun = int(y.nunique())
+    task = D.get("task", "auto")
+    resolved = task if task != "auto" else ("classification" if ykind != "numeric" or (nun <= 20 and np.all(np.mod(yv.dropna(), 1) == 0)) else "regression")
+    if y.isna().any():
+        add("info", "target_missing", f"{int(y.isna().sum())} rows have no target", "They are dropped before training.")
+    if task == "regression" and ykind != "numeric":
+        add("error", "task_mismatch", "Regression on a non-numeric target", f"'{target}' contains text labels, so it must be classification.", [{"block": "dataset", "settings": {"task": "classification"}}])
+    if task == "classification" and ykind == "numeric" and nun > 50:
+        add("error", "task_mismatch", "Classification on a continuous target", f"'{target}' has {nun} distinct numeric values; that is a regression problem.", [{"block": "dataset", "settings": {"task": "regression"}}])
+    if task == "auto" and resolved == "classification" and ykind == "numeric" and nun > 5:
+        add("info", "task_auto", f"'{target}' is treated as classification", f"It has only {nun} integer values. If it is a count or a score, set the task to regression.", [{"block": "dataset", "settings": {"task": "regression"}}])
+    if resolved == "classification" and nun > 50:
+        add("error", "too_many_classes", "Too many classes", f"The target has {nun} classes (max 50).", [{"block": "dataset", "settings": {"task": "regression"}}] if ykind == "numeric" else None)
+    # ---- leakage
+    for f in (cfg.get("fe") or {}).get("custom_features") or []:
+        import re
+        if re.search(r"(?<![\w])" + re.escape(str(target)) + r"(?![\w])", str(f.get("expr", ""))):
+            add("error", "leak_custom", f"Custom feature '{f.get('name')}' uses the target", f"'{f.get('expr')}' is computed from '{target}', so the model would see the answer (target leakage).", [{"block": "fe", "remove_feature": f.get("name")}])
+    prof = {c["name"]: c for c in profile(df)["cols"]}
+    samp = df.iloc[sample_idx(n, 20000, 13)]
+    ys = samp[target]
+    ycode = pd.to_numeric(ys, errors="coerce") if resolved == "regression" else pd.Series(pd.Categorical(ys.astype(str)).codes, index=ys.index).astype(float)
+    binary = resolved == "classification" and nun == 2
+    for c in feats:
+        s = samp[c]
+        if s.astype(str).equals(ys.astype(str)):
+            add("error", "leak_copy", f"'{c}' is a copy of the target", "Remove it from the features.", [{"block": "dataset", "add_exclude": [c]}], model=None)
+            continue
+        if prof.get(c, {}).get("id_like"):
+            add("warning", "id_feature", f"'{c}' looks like an ID column", "Row identifiers carry no signal and let models memorise rows. Exclude it.", [{"block": "dataset", "add_exclude": [c]}])
+            continue
+        if pd.api.types.is_numeric_dtype(s) and (resolved == "regression" or binary) and s.nunique() > 2:
+            ok = s.notna() & ycode.notna()
+            if ok.sum() > 10 and s[ok].std() > 0 and ycode[ok].std() > 0:
+                r = float(np.corrcoef(s[ok], ycode[ok])[0, 1])
+                if abs(r) >= 0.97:
+                    add("warning", "leak_corr", f"'{c}' is almost identical to the target (r = {r:.3f})", "Such a strong relation usually means the column is derived from the target or only known afterwards (leakage). Exclude it unless it is truly available at prediction time.", [{"block": "dataset", "add_exclude": [c]}])
+        elif resolved == "classification" and not pd.api.types.is_numeric_dtype(s) and 1 < s.nunique() < 0.5 * len(s):
+            purity = samp.groupby(s.astype(str))[target].agg(lambda v: v.astype(str).value_counts(normalize=True).iloc[0]).mean()
+            if purity > 0.999:
+                add("warning", "leak_purity", f"'{c}' determines the target exactly", "Every value of this column maps to one class. Check that it is not derived from the target.", [{"block": "dataset", "add_exclude": [c]}])
+    # ---- split / validation
+    sp, cv = cfg.get("split") or {}, cfg.get("cv") or {}
+    ts, vs, strat = float(sp.get("test_size", 0.2)), float(sp.get("val_size", 0.1)), cv.get("strategy", "stratified_kfold")
+    if ts + vs >= 0.6:
+        add("warning", "small_train", "Very small training set", f"Test {ts:.0%} + validation {vs:.0%} leaves only {1 - ts - vs:.0%} for training.", [{"block": "split", "settings": {"test_size": 0.2, "val_size": 0.1}}])
+    if strat == "none" and vs <= 0:
+        add("error", "select_on_test", "Models are selected on the test set", "Without cross-validation or a validation set, the leaderboard ranks models by test score, so the test score is no longer an unbiased estimate.", [{"block": "split", "settings": {"cv_strategy": "stratified_kfold" if resolved == "classification" else "kfold", "folds": 5}}])
+    if D.get("time_col") and sp.get("shuffle", True) and strat != "time_series":
+        add("warning", "time_shuffle", "Time data is shuffled", "With a time column, shuffled splits train on the future and test on the past. Use time-ordered splits.", [{"block": "split", "settings": {"shuffle": False, "cv_strategy": "time_series"}}])
+    if strat == "group_kfold" and not D.get("group_col"):
+        add("error", "group_missing", "Group K-fold without a group column", "Set a group column in the Dataset block (for example a patient or customer id) or choose another CV.", [{"block": "split", "settings": {"cv_strategy": "stratified_kfold" if resolved == "classification" else "kfold"}}])
+    if resolved == "regression" and strat in ("stratified_kfold", "repeated_stratified_kfold", "stratified_shuffle_split"):
+        add("info", "strat_regression", "Stratified CV on a regression task", "Stratification needs classes, so plain K-fold is used.", [{"block": "split", "settings": {"cv_strategy": "kfold"}}])
+    counts = y.astype(str).value_counts() if resolved == "classification" else None
+    folds = int(cv.get("folds", 5))
+    if counts is not None and strat != "none" and counts.min() * (1 - ts - vs) < folds:
+        add("warning", "tiny_class", f"Class '{counts.idxmin()}' is too small for {folds}-fold CV", f"It has {int(counts.min())} rows in total.", [{"block": "split", "settings": {"folds": max(2, int(counts.min() * (1 - ts - vs)))}}])
+    # ---- imbalance / metric
+    P, ev = cfg.get("preprocess") or {}, cfg.get("eval") or {}
+    pm = ev.get("primary_metric", "auto")
+    if counts is not None:
+        share = counts.min() / counts.sum()
+        if share < 0.2 and pm == "accuracy":
+            add("warning", "accuracy_imbalanced", f"Accuracy on imbalanced classes (minority {share:.0%})", "A model predicting only the majority class already scores high accuracy. Rank by F1 or balanced accuracy and weight the classes.", [{"block": "eval", "settings": {"primary_metric": "f1" if nun == 2 else "balanced_accuracy"}}, {"block": "preprocess", "settings": {"imbalance": "class_weight"}}])
+        elif share < 0.2 and P.get("imbalance", "none") == "none":
+            add("info", "imbalanced", f"Imbalanced classes (minority {share:.0%})", "Consider class weights or SMOTE in Preprocessing.", [{"block": "preprocess", "settings": {"imbalance": "class_weight"}}])
+        if P.get("imbalance") == "smote" and counts.min() < 6:
+            add("warning", "smote_tiny", "SMOTE with a tiny class", "SMOTE needs several examples per class; use random oversampling.", [{"block": "preprocess", "settings": {"imbalance": "random_over"}}])
+    if resolved == "regression" and P.get("imbalance", "none") != "none":
+        add("warning", "imbalance_regression", "Class-imbalance handling on a regression task", "It only applies to classification and is ignored.", [{"block": "preprocess", "settings": {"imbalance": "none"}}])
+    if pm != "auto" and ((resolved == "classification" and pm in REG_ONLY_METRICS) or (resolved == "regression" and pm in CLS_ONLY_METRICS)):
+        add("error", "metric_task", f"Metric '{pm}' does not fit a {resolved} task", "The ranking metric must match the task.", [{"block": "eval", "settings": {"primary_metric": "auto"}}])
+    # ---- preprocessing / FE / FS
+    keys = {m.get("key") for m in cfg.get("models") or []}
+    sens = sorted(keys & SCALE_SENSITIVE)
+    if P.get("scaling", "standard") == "none" and sens:
+        add("warning", "no_scaling", "No feature scaling for scale-sensitive models", f"{', '.join(sens)} depend on feature scale (distances, gradients, regularisation). Use StandardScaler.", [{"block": "preprocess", "settings": {"scaling": "standard"}}])
+    if P.get("num_impute") == "drop":
+        lost = float(df[feats].isna().any(axis=1).mean()) if feats else 0
+        if lost > 0.3:
+            add("warning", "drop_rows", f"Dropping rows with missing values loses {lost:.0%} of the data", "Impute instead.", [{"block": "preprocess", "settings": {"num_impute": "median"}}])
+    numc = [c for c in feats if prof.get(c, {}).get("kind") == "numeric"]
+    FE, FS = cfg.get("fe") or {}, cfg.get("fs") or {}
+    deg = int(FE.get("polynomial", 0) or 0)
+    pc = len(FE.get("poly_columns") or []) or len(numc)
+    if deg >= 2:
+        nfeat = math.comb(pc + deg, deg) - 1
+        if nfeat > 400:
+            add("warning", "poly_explosion", f"Polynomial features create about {nfeat} columns", "That slows training and invites overfitting. Use degree 2 on a few chosen columns.", [{"block": "fe", "settings": {"polynomial": 2, "poly_columns": numc[:5]}}])
+    if resolved == "regression" and FS.get("method") == "kbest_chi2":
+        add("warning", "chi2_regression", "chi² selection on a regression task", "chi² only works for classification (F-test is used instead).", [{"block": "fs", "settings": {"method": "kbest_f"}}])
+    if resolved == "regression" and FS.get("reduction") == "lda":
+        add("error", "lda_regression", "LDA projection on a regression task", "LDA needs classes, so it is skipped. Use PCA.", [{"block": "fs", "settings": {"reduction": "pca"}}])
+    if FS.get("method") in ("sfs_forward", "sfs_backward") and len(feats) > 25:
+        add("info", "sfs_slow", "Sequential feature selection is slow with many columns", "It refits the model many times per CV fold. Mutual information or tree importance is much faster.", [{"block": "fs", "settings": {"method": "kbest_mi"}}])
+    if FS.get("reduction") in ("pca", "svd", "ica", "kernel_pca") and keys & {"rf", "et", "xgb", "lgbm", "hgb", "gb", "dt"}:
+        add("info", "pca_trees", "Dimensionality reduction before tree models", "Trees handle raw features well, and PCA hides which inputs matter.")
+    # ---- models / tuning
+    if not cfg.get("models"):
+        add("error", "no_models", "No models in the pipeline", "Add model blocks or a Model Zoo.", [{"add_block": "zoo"}])
+    for m in cfg.get("models") or []:
+        if resolved not in (m.get("tasks") or [resolved]) and "__" not in m["id"]:
+            add("warning", "model_task", f"{m['name']} does not support {resolved}", "It will be skipped.", [{"block": m["id"], "remove": True}], model=m["id"])
+    T = cfg.get("tuning") or {}
+    if T.get("enabled") and T.get("method") in ("optuna", "bayesian") and int(T.get("n_iter", 20)) < 8:
+        add("info", "few_trials", "Very few tuning trials", "Bayesian optimisation needs about 15+ trials to beat random search.", [{"block": "tuning", "settings": {"n_iter": 20}}])
+    # ---- results (only for the same target)
+    R = S.get("results")
+    if R and S.get("cfg", {}).get("dataset", {}).get("target") == target and "D" in S:
+        prim = S["D"]["primary"]
+        lower = prim in LOWER_BETTER
+        base = next((r for r in R.values() if r.get("baseline") and r["status"] == "ok"), None)
+        ranked = _ranked(R, prim)
+        for r in R.values():
+            if r["status"] != "ok":
+                add("error", "model_failed", f"{r['name']} failed", f"{r.get('error', '')[:400]} — {_error_hint(r.get('error', ''))}", None, model=r["id"])
+        for r in ranked[:5]:
+            gap = r.get("overfit_gap")
+            if gap is not None and gap > (0.1 if S["D"]["task"] == "classification" else 0.15) and not r.get("ensemble"):
+                fx = OVERFIT_FIX.get(r["key"])
+                add("warning", "overfit", f"{r['name']} overfits (train − test gap {gap:.3f})", "It fits the training data much better than new data. Regularise it or give it less capacity.",
+                    [{"block": r.get("tuned_from") or r["id"], "settings": fx}] if fx and "__" not in (r.get("tuned_from") or r["id"]) else None, model=r["id"])
+            t = (r.get("test") or {}).get(prim)
+            if t is not None and not lower and t >= 0.999 and prim in ("accuracy", "r2", "roc_auc", "f1", "balanced_accuracy"):
+                add("warning", "too_perfect", f"{r['name']} scores a perfect {t:.4f} on the test set", "Perfect scores on real data usually mean leakage: a feature that encodes the target, duplicates across splits, or an ID. Check the leakage warnings above.", model=r["id"])
+        if base and ranked:
+            b, s = base.get("score"), ranked[0].get("score")
+            if b is not None and s is not None and (s <= b + 1e-3 if not lower else s >= b - 1e-3):
+                add("error", "no_better_than_baseline", "The best model is no better than guessing", f"Baseline {prim} {b:.4f} vs best {s:.4f}. The features may carry no signal, the target may be wrong, or preprocessing may remove the useful columns.")
+        for r in ranked[:3]:
+            c = (r.get("cv") or {}).get(prim)
+            if c and c["std"] > 0.05 and not lower:
+                add("info", "cv_unstable", f"{r['name']} is unstable across CV folds (± {c['std']:.3f})", "Scores vary a lot between folds: more data, repeated CV or a simpler model will give more reliable results.", model=r["id"])
+        for r in R.values():
+            tu = r.get("tuning")
+            if tu and tu.get("before") is not None and tu.get("after") is not None and ((tu["after"] <= tu["before"]) if not lower else (tu["after"] >= tu["before"])):
+                add("info", "tuning_no_gain", f"Tuning did not improve {r['name'].replace(' (tuned)', '')}", "Widen the search space or run more trials.", [{"block": "tuning", "settings": {"n_iter": max(30, int(T.get("n_iter", 20)) * 2)}}], model=r["id"])
+    order = {"error": 0, "warning": 1, "info": 2}
+    issues.sort(key=lambda i: order[i["severity"]])
+    return dumps({"issues": issues, "task": resolved})
 
 
 @safe
@@ -1781,7 +2318,7 @@ def predict_with_artifact(art, rows):
 @safe
 def versions():
     out = {"python": sys.version.split()[0], "browser": IN_BROWSER}
-    for m in ("numpy", "pandas", "scipy", "sklearn", "xgboost", "lightgbm", "matplotlib"):
+    for m in ("numpy", "pandas", "scipy", "sklearn", "xgboost", "lightgbm", "matplotlib", "optuna"):
         try:
             out[m] = importlib.import_module(m).__version__
         except Exception:

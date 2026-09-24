@@ -7,7 +7,7 @@ import { Engine } from './engine-client.js';
 import * as C from './canvas.js';
 import { render as renderConfig, refreshBlockChat } from './config-panel.js';
 import { renderData, renderDocs, SAMPLES } from './data-panel.js';
-import { renderDashboard, updateRunBar, leaderboardCSV, openModel } from './dashboard.js';
+import { renderDashboard, updateRunBar, leaderboardCSV, openModel, describeFix } from './dashboard.js';
 import { ChatView, newThread, clearThread } from './chat.js';
 import { AI, saveAI, listModels, chat, FALLBACK_MODELS, setAgentAPI, resolveBlock, leaderboard, aiReady } from './ai.js';
 import { A } from './actions.js';
@@ -16,6 +16,7 @@ Object.assign(S.settings, store.get('settings', {}));
 S.instructions = store.get('instructions', '');
 S.chat = newThread();
 S.liveLog = [];
+S.autoFixCount = 0;
 const saved = store.get('state', null);
 const short = (s, n = 18) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
 
@@ -189,8 +190,9 @@ export function buildConfig() {
     advanced: { max_train_rows: +S.settings.maxTrainRows || 0, slow_model_rows: +S.settings.slowModelRows || 3000 },
   };
 }
-async function run() {
+async function run(opts = {}) {
   if (S.running) return { error: 'A run is already in progress.' };
+  if (opts.source !== 'agent' && opts.source !== 'auto') S.autoFixCount = 0;
   if (S.engine.status !== 'ready') { toast('The Python engine is still loading.'); return { error: 'The Python engine is still loading.' }; }
   let cfg;
   try { cfg = buildConfig(); } catch (e) { toast(e.message); return { error: e.message }; }
@@ -199,6 +201,7 @@ async function run() {
   for (const n of S.nodes) { n.status = reach.has(n.id) ? 'pending' : 'skipped'; n.metric = ''; n.statusText = ''; }
   nodeOf('dataset').status = 'done';
   S.running = true; S.runStart = Date.now(); S.progress = { message: 'Preparing data…' }; S.lastError = null; S.liveLog = [];
+S.autoFixCount = 0;
   renderAll();
   try {
     const res = await engine.call('run', JSON.stringify(cfg));
@@ -208,12 +211,13 @@ async function run() {
     S.history.push({ time: Date.now(), dataset: S.dataName, target: cfg.dataset.target, task: res.task, models: Object.values(res.models).filter(m => m.status === 'ok').length, best: best.name, metric: res.primary, score: best.score, test: best.test[res.primary], duration: res.duration, pipeline: snapshot() });
     S.ui.model = res.best; S.ui.compare = []; S.ui.lastPred = null; S.ui.form = null;
     toast(`Done in ${fmtTime(res.duration)} — best: ${best.name} (${optLabel(res.primary)} ${fmt(best.score)})`);
+    diagnose().then(() => setTimeout(() => maybeAutoFix(opts), 50));
     return leaderboard();
   } catch (e) {
     const stopped = e.message === 'Stopped';
     S.lastError = stopped ? null : e.message;
     for (const n of S.nodes) if (n.status === 'pending' || n.status === 'running') n.status = stopped ? 'idle' : 'error';
-    if (!stopped) toast('Run failed: ' + e.message, null, 6000);
+    if (!stopped) { toast('Run failed: ' + e.message, null, 6000); diagnose().then(() => setTimeout(() => maybeAutoFix(opts), 50)); }
     return { error: stopped ? 'Stopped by the user.' : e.message };
   } finally { S.running = false; S.progress = null; renderAll(); }
 }
@@ -337,7 +341,7 @@ print(f"Wrote {len(df)} predictions to {dest}")
 `;
 function requirements() {
   const v = S.engine.versions || {};
-  return [`scikit-learn==${v.sklearn || '1.6.1'}`, `numpy`, `pandas`, `scipy`, `joblib`, v.xgboost ? `xgboost==${v.xgboost}` : 'xgboost', v.lightgbm ? `lightgbm==${v.lightgbm}` : 'lightgbm', 'matplotlib', 'fastapi', 'uvicorn[standard]'].join('\n') + '\n';
+  return [`scikit-learn==${v.sklearn || '1.6.1'}`, `numpy`, `pandas`, `scipy`, `joblib`, v.xgboost ? `xgboost==${v.xgboost}` : 'xgboost', v.lightgbm ? `lightgbm==${v.lightgbm}` : 'lightgbm', 'matplotlib', 'optuna', 'fastapi', 'uvicorn[standard]'].join('\n') + '\n';
 }
 function exportReadme() {
   const R = S.results, best = R?.models[R.best];
@@ -454,6 +458,7 @@ async function openSettings(section = 'ai') {
   const temp = h('input', { type: 'number', min: 0, max: 2, step: 0.1, value: AI.temperature });
   const think = h('select', {}, ['default', 'off', 'on', 'low', 'medium', 'high'].map(v => h('option', { value: v, selected: AI.think === v }, v === 'default' ? 'Model default' : v)));
   const confirmBox = h('input', { type: 'checkbox', checked: AI.confirm });
+  const autoFixBox = h('input', { type: 'checkbox', checked: AI.autoFix });
   const status = h('div', { class: 'sm muted', style: 'margin-top:6px' });
   const fillModels = (list, note) => {
     modelSel.innerHTML = '';
@@ -462,7 +467,7 @@ async function openSettings(section = 'ai') {
     for (const m of names) modelSel.append(h('option', { value: m.name, selected: m.name === AI.model }, m.name + (m.size ? ` (${(m.size / 1e9).toFixed(0)} GB)` : '')));
     if (note) status.textContent = note;
   };
-  const collect = () => ({ provider: provider.value, apiKey: key.value.trim(), remember: remember.checked, baseUrl: base.value.trim() || 'http://localhost:11434', model: custom.value.trim() || modelSel.value, temperature: +temp.value || 0, think: think.value, confirm: confirmBox.checked });
+  const collect = () => ({ provider: provider.value, apiKey: key.value.trim(), remember: remember.checked, baseUrl: base.value.trim() || 'http://localhost:11434', model: custom.value.trim() || modelSel.value, temperature: +temp.value || 0, think: think.value, confirm: confirmBox.checked, autoFix: autoFixBox.checked });
   const refresh = async () => {
     saveAI(collect()); status.textContent = 'Loading models…';
     try { const list = await listModels(); fillModels(list, `${list.length} models available.`); } catch (e) { fillModels([], 'Could not list models (' + e.message + '). Showing common cloud models.'); }
@@ -486,6 +491,7 @@ async function openSettings(section = 'ai') {
       h('div', { class: 'xs muted' }, 'Tool calling works best with gpt-oss, qwen3, kimi, glm, deepseek and minimax cloud models.'),
       h('div', { class: 'grid2', style: 'margin-top:0' }, fld('Temperature', temp), fld('Thinking', think)),
       h('label', { class: 'chk' }, confirmBox, 'Ask me before the AI changes the pipeline, trains or runs code'),
+      h('label', { class: 'chk' }, autoFixBox, 'When a run has errors, let the AI diagnose and fix them automatically (at most 2 attempts)'),
       h('div', { class: 'row' }, h('button', { class: 'btn', onclick: async () => {
         saveAI(collect()); status.textContent = 'Testing…';
         try { const r = await chat({ messages: [{ role: 'user', content: 'Reply with exactly: OK' }], stream: false }); status.innerHTML = `<span class="okc">Connected to ${esc(AI.model)}</span> — replied “${esc(r.content.trim().slice(0, 60))}”`; } catch (e) { status.innerHTML = `<span class="err">${esc(e.message)}</span>`; }
@@ -558,7 +564,7 @@ setAgentAPI({
     C.deleteNode(n.id); C.tidy(); S.customized = true; autosave(); C.renderCanvas(); renderConfig();
     return { ok: true, removed: t };
   },
-  runPipeline: () => run(),
+  runPipeline: () => run({ source: 'agent' }),
   modelDetails(ref) {
     const R = S.results; if (!R) return { error: 'No results yet. Run the pipeline first.' };
     const m = findModel(ref);
@@ -602,7 +608,151 @@ setAgentAPI({
   show(tab, ref) { if (ref) { const m = findModel(ref); if (m) S.ui.model = m.id; } S.ui.dashTab = tab; renderDashboard(); $('#dash')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); return { ok: true, tab }; },
   testRows: (start, count) => engine.call('test_rows', start, count),
   exportThing,
+  async diagnose() { const dg = await diagnose(); return { issues: dg.issues.map(i => ({ id: i.id, severity: i.severity, title: i.title, detail: i.detail, fix: i.fix || undefined, model: i.model || undefined })), error: dg.error }; },
+  applyFixes: ids => applyFixes(ids),
+  retrainModels: refs => retrainModels(refs),
+  listCells: () => listCells(),
+  writeCell: (id, code, runIt) => writeCell(id, code, runIt !== false),
 });
+
+// ------------------------------------------------ doctor, fixes, python lab
+async function diagnose() {
+  let cfg;
+  try { cfg = buildConfig(); } catch (e) { S.diag = { issues: [{ id: 'config', severity: 'error', code: 'config', title: 'The pipeline cannot run', detail: e.message, fix: null }], time: Date.now(), applied: new Set() }; afterDiag(); return S.diag; }
+  try { const r = await engine.call('diagnose', JSON.stringify(cfg)); S.diag = { issues: r.issues || [], time: Date.now(), applied: new Set() }; }
+  catch (e) { S.diag = { issues: [], error: e.message, time: Date.now(), applied: new Set() }; }
+  afterDiag();
+  return S.diag;
+}
+function afterDiag() { if (S.ui.dashTab === 'doctor') renderDashboard(); else updateRunBar(); }
+function applyPatch(p) {
+  if (p.add_block) {
+    const n = C.insertNode(p.add_block);
+    if (p.settings) Object.assign(n.cfg, sanitizeBlock(p.add_block, p.settings, columns()));
+    return `added ${C.nodeTitle(n)}`;
+  }
+  let n = resolveBlock(p.block);
+  if (!n && BLOCKS[p.block] && p.block !== 'model') n = C.insertNode(p.block);
+  if (!n) throw new Error(`Block ${p.block} not found`);
+  const title = C.nodeTitle(n);
+  if (p.remove) { C.deleteNode(n.id); C.tidy(); return `removed ${title}`; }
+  if (p.add_exclude) { n.cfg.exclude = [...new Set([...(n.cfg.exclude || []), ...p.add_exclude])]; return `excluded ${p.add_exclude.join(', ')}`; }
+  if (p.remove_feature) { n.cfg.custom_features = (n.cfg.custom_features || []).filter(f => f.name !== p.remove_feature); return `deleted feature ${p.remove_feature}`; }
+  const applied = n.type === 'model' ? sanitizeModelParams(n.key, p.settings || {}, C.taskGuess()) : sanitizeBlock(n.type, p.settings || {}, columns());
+  Object.assign(n.cfg, applied);
+  return `${title}: ${Object.entries(applied).map(([k, v]) => `${k}=${Array.isArray(v) ? v.join(',') : v}`).join(', ')}`;
+}
+function applyFixes(ids) {
+  const all = S.diag?.issues || [];
+  const pick = ids.includes('all') ? all.filter(i => i.fix) : all.filter(i => ids.includes(i.id));
+  const applied = [], skipped = [];
+  for (const i of pick) {
+    if (!i.fix) { skipped.push({ id: i.id, reason: 'no automatic fix; use update_block or explain it' }); continue; }
+    if (S.diag.applied?.has(i.id)) { skipped.push({ id: i.id, reason: 'already applied' }); continue; }
+    try { applied.push({ id: i.id, title: i.title, changes: i.fix.map(applyPatch) }); S.diag.applied.add(i.id); }
+    catch (e) { skipped.push({ id: i.id, reason: e.message }); }
+  }
+  const unknown = ids.filter(x => x !== 'all' && !all.some(i => i.id === x));
+  if (applied.length) { S.customized = true; S.dirty = true; autosave(); C.renderCanvas(); renderConfig(); toast(`Applied ${applied.length} fix${applied.length > 1 ? 'es' : ''}. Run the pipeline to see the effect.`); }
+  return { applied, skipped, unknown_ids: unknown.length ? unknown : undefined, next: applied.length ? 'Run the pipeline (or retrain_models for model-only changes) to verify.' : undefined };
+}
+async function retrainModels(refs) {
+  if (!S.results) return { error: 'Run the pipeline first.' };
+  if (S.running) return { error: 'A run is in progress.' };
+  let cfg;
+  try { cfg = buildConfig(); } catch (e) { return { error: e.message }; }
+  const ids = [];
+  for (const r of refs || []) {
+    const s = String(r);
+    const hit = cfg.models.find(m => m.id === s) || cfg.models.find(m => m.id === resolveBlock(s)?.id) || cfg.models.find(m => m.id === S.results.models[s]?.tuned_from) || cfg.models.find(m => m.key === s);
+    if (hit && !ids.includes(hit.id)) ids.push(hit.id);
+  }
+  if (!ids.length) return { error: `No matching model blocks. Model ids: ${cfg.models.map(m => `${m.id} (${m.name})`).join(', ')}` };
+  S.running = true; S.runStart = Date.now(); S.progress = { message: 'Retraining…' };
+  for (const id of ids) { const n = node(id); if (n) n.status = 'running'; }
+  renderRunStatus(); C.renderNodes(); updateRunBar();
+  try {
+    const res = await engine.call('retrain_models', JSON.stringify(cfg), JSON.stringify(ids));
+    const report = res.retrained; delete res.retrained;
+    S.results = { ...res, duration: S.results.duration };
+    applyStatuses(S.results, C.reachable(nodeOf('dataset').id));
+    diagnose();
+    return { retrained: report, leaderboard: leaderboard() };
+  } catch (e) { for (const id of ids) { const n = node(id); if (n) n.status = 'error'; } return { error: e.message }; }
+  finally { S.running = false; S.progress = null; renderAll(); }
+}
+function maybeAutoFix(opts = {}) {
+  if (opts.source === 'agent' || !AI.autoFix || !aiReady() || !mainChat || mainChat.busy) return;
+  const failed = S.results ? Object.values(S.results.models).filter(m => m.status !== 'ok') : [];
+  const errs = (S.diag?.issues || []).filter(i => i.severity === 'error');
+  if (!S.lastError && !failed.length && !errs.length) return;
+  if (S.autoFixCount >= 2) return;
+  S.autoFixCount++;
+  toast('Problems found — the AI is diagnosing and fixing them…', null, 4000);
+  fixWithAI('auto');
+}
+
+const DEFAULT_CELL = `# Python Lab: run any code on your data and trained models (Shift+Enter).
+# Available after a run: X_train, X_test, y_train, y_test, models, results, best_model_id, register_model(...)
+print(df.shape)
+df.describe().T.head(10)`;
+S.cells = (store.get('cells', null) || [{ id: 'c1', code: DEFAULT_CELL }]).map(c => ({ id: c.id, code: c.code }));
+const saveCells = debounce(() => store.set('cells', S.cells.map(c => ({ id: c.id, code: c.code }))), 400);
+function newCellId() { let i = 1; while (S.cells.some(c => c.id === 'c' + i)) i++; return 'c' + i; }
+function addCell(code = '') { const c = { id: newCellId(), code }; S.cells.push(c); saveCells(); return c; }
+async function runCell(id) {
+  const c = S.cells.find(x => x.id === id);
+  if (!c) return { error: `No cell ${id}. Cells: ${S.cells.map(x => x.id).join(', ')}` };
+  c.running = true;
+  if (S.ui.dashTab === 'code') renderDashboard();
+  try {
+    c.out = await engine.call('run_code', c.code);
+    if (c.out.results_changed) { S.results = await engine.call('get_summary'); toast('Leaderboard updated from custom code'); }
+  } catch (e) { c.out = { error: e.message }; }
+  c.running = false;
+  if (S.ui.dashTab === 'code') renderDashboard();
+  return c.out;
+}
+async function writeCell(id, code, runIt = true) {
+  let c = id ? S.cells.find(x => x.id === String(id)) : null;
+  if (!c) { c = addCell(''); if (id && /^c\d+$/.test(String(id)) && !S.cells.some(x => x.id === String(id))) c.id = String(id); }
+  c.code = String(code ?? ''); c.out = null; saveCells();
+  S.ui.dashTab = 'code'; renderDashboard();
+  if (runIt === false) return { cell_id: c.id, saved: true };
+  const out = await runCell(c.id);
+  return { cell_id: c.id, status: out.exception || out.error ? 'error' : 'ok', ...out };
+}
+function listCells() {
+  return S.cells.map(c => ({ cell_id: c.id, code: c.code, status: c.out ? (c.out.exception || c.out.error ? 'error' : 'ok') : 'not run', error: c.out?.error_info || c.out?.error || undefined, stdout: c.out?.stdout ? c.out.stdout.slice(-600) : undefined, warnings: c.out?.warnings?.length ? c.out.warnings : undefined }));
+}
+function fixWithAI(kind, p = {}) {
+  const fence = code => '```python\n' + code + '\n```';
+  let q;
+  if (kind === 'cell' || kind === 'review') {
+    const c = S.cells.find(x => x.id === p.id); if (!c) return;
+    const e = c.out?.error_info;
+    q = kind === 'cell'
+      ? `Python Lab cell ${c.id} has a problem.\n\n${fence(c.code)}\n${e ? `Error${e.line ? ` on line ${e.line}` : ''}: ${e.type}: ${e.message}\nHint: ${e.hint}\n` : c.out?.error ? `Error: ${c.out.error}\n` : ''}${c.out?.warnings?.length ? `Review warnings: ${c.out.warnings.join(' ')}\n` : ''}\nFind the root cause, correct the code with write_code_cell (cell_id "${c.id}"), run it again and repeat until it works. Fix conceptual ML mistakes too, then explain briefly what was wrong.`
+      : `Review Python Lab cell ${c.id} for bugs and conceptual ML mistakes (data leakage, fitting or selecting on test data, wrong metric or target encoding, wrong pairing of X and y).\n\n${fence(c.code)}\n${c.out?.warnings?.length ? `Static review warnings: ${c.out.warnings.join(' ')}\n` : ''}If you find problems, fix them with write_code_cell (cell_id "${c.id}") and run it to verify. Explain what you changed, or confirm the code is correct.`;
+  } else if (kind === 'code') {
+    q = `This code has a problem:\n${fence(p.code)}\n${p.error}\nFix it: write the corrected code with write_code_cell, run it until it works, and explain the fix.`;
+  } else if (kind === 'model') {
+    q = `Model "${p.name}" (id ${p.id}) failed with this error:\n${p.error}\nDiagnose the root cause, fix the model block with update_block (or apply_fixes), verify with retrain_models, and explain what was wrong.`;
+  } else if (kind === 'issue') {
+    const i = p.issue;
+    q = `The Pipeline Doctor reports [${i.severity}] ${i.title}: ${i.detail}${i.fix ? ` Suggested fix: ${describeFixText(i.fix)}.` : ''} (issue id ${i.id})\nIs this a real problem for my data? If yes, fix it (apply_fixes or update_block), verify, and explain.`;
+  } else if (kind === 'doctor') {
+    const list = (S.diag?.issues || []).map(i => `- [${i.severity}] ${i.title} (id ${i.id}): ${i.detail}`).join('\n');
+    q = `The Pipeline Doctor found these problems:\n${list}\n\nFix the real problems (apply_fixes where a fix exists, otherwise update_block), say which were conceptual ML mistakes, then run the pipeline to verify and summarise the before / after.`;
+  } else {
+    const failed = S.results ? Object.values(S.results.models).filter(m => m.status !== 'ok') : [];
+    const errs = (S.diag?.issues || []).filter(i => i.severity === 'error' && i.code !== 'model_failed');
+    const parts = [S.lastError ? `The run failed: ${S.lastError}` : '', ...failed.map(m => `Model ${m.name} (id ${m.id}) failed: ${m.error}`), ...errs.map(i => `Pipeline Doctor [error] ${i.title} (id ${i.id}): ${i.detail}`)].filter(Boolean);
+    q = `Something went wrong in the last run:\n${parts.map(x => '- ' + x).join('\n')}\n\nFollow the debugging protocol: diagnose, fix the root causes, verify (retrain_models for model settings, run_pipeline for data or preprocessing changes), then explain what was wrong and what you changed.`;
+  }
+  askAI(q);
+}
+const describeFixText = fix => fix.map(x => JSON.stringify(x)).join('; ');
 
 // ---------------------------------------------------------------- rendering
 function applyTheme() {
@@ -644,7 +794,7 @@ function askAI(text) {
 }
 
 Object.assign(A, {
-  run, stop, analyze, exportThing, openSettings, sampleMenu, loadSample, loadFile, loadPreview, loadEDA, refreshTargetDependent, askAI, restoreRun,
+  run, stop, analyze, exportThing, openSettings, diagnose, applyFixes, retrainModels, fixWithAI, runCell, writeCell, addCell, saveCells, sampleMenu, loadSample, loadFile, loadPreview, loadEDA, refreshTargetDependent, askAI, restoreRun,
   openFile: () => $('#fileIn').click(),
 });
 
@@ -660,7 +810,7 @@ function init() {
   C.bindCanvas();
   mainChat = new ChatView($('#chatBox'), () => S.chat, { chips: ['Run the pipeline and summarise all models', 'Why is the best model the best?', 'Add LightGBM and a stacking ensemble, then run', 'Plot the errors of the best model on the test set'] });
   $('#chatClear').onclick = () => { clearThread(S.chat); mainChat.render(); };
-  $('#btnRun').onclick = () => (S.running ? stop() : run());
+  $('#btnRun').onclick = () => (S.running ? stop() : run({ source: 'user' }));
   $('#btnSave').onclick = () => { autosave(); download('ml-agent-pipeline.json', pipelineJSON(), 'application/json'); toast('Pipeline saved (also kept in this browser)'); };
   $('#btnLoad').onclick = () => $('#pipeIn').click();
   $('#pipeIn').onchange = e => { const f = e.target.files[0]; if (f) loadPipelineFile(f); e.target.value = ''; };

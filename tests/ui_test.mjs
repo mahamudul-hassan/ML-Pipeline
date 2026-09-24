@@ -24,7 +24,7 @@ const zipped = {};
 w.JSZip = class { file(n, d) { zipped[n] = d; } async generateAsync() { return new Blob(['zip']); } };
 
 // Python engine over stdin/stdout
-const py = spawn('python3', [new URL('tests/rpc_server.py', root).pathname], { stdio: ['pipe', 'pipe', 'inherit'] });
+const py = spawn(process.env.PYTHON || 'python3', [new URL('tests/rpc_server.py', root).pathname], { stdio: ['pipe', 'pipe', 'inherit'] });
 const queue = [];
 const transport = { onmessage: null, send: m => py.stdin.write(JSON.stringify(m) + '\n'), start() { for (const m of queue.splice(0)) this.onmessage(m); } };
 readline.createInterface({ input: py.stdout }).on('line', l => { const m = JSON.parse(l); transport.onmessage ? transport.onmessage(m) : queue.push(m); });
@@ -67,10 +67,15 @@ const t0 = Date.now();
 const lb = await A.run();
 ok(!lb.error && S.results, `run finished in ${((Date.now() - t0) / 1000).toFixed(1)}s: ${lb.error || lb.rows.map(r => `${r.name}=${r[lb.ranked_by]}`).join(', ')}`);
 ok(S.nodes.filter(n => n.type === 'model').every(n => n.status === 'done' && n.metric), 'model nodes show status + metric');
-const tabs = ['overview', 'leaderboard', 'model', 'compare', 'tuning', 'explain', 'data', 'predict', 'logs', 'runs'];
+const xgbRes = Object.values(S.results.models).find(m => m.key === 'xgb' && !m.tuned_from);
+ok(xgbRes && xgbRes.status === 'ok', 'XGBoost trained: ' + (xgbRes?.status === 'ok' ? xgbRes.score.toFixed(4) : xgbRes?.error));
+const tunedRes = Object.values(S.results.models).filter(m => m.tuning);
+ok(tunedRes.length === 3 && tunedRes.every(m => m.tuning.method === 'optuna' && m.tuning.history.length === 20 && m.tuning.importance), 'Optuna tuned top 3: ' + tunedRes.map(m => `${m.name} ${m.tuning.method} ${m.tuning.before.toFixed(4)}→${m.tuning.after.toFixed(4)}`).join('; '));
+const tabs = ['overview', 'doctor', 'leaderboard', 'model', 'compare', 'tuning', 'explain', 'data', 'predict', 'logs', 'code', 'runs'];
 const { renderDashboard } = await import(new URL('src/dashboard.js', root));
 for (const tab of tabs) {
   S.ui.dashTab = tab; plots = 0; renderDashboard(); await flush();
+  if (tab === 'tuning') ok(plots === 4, `tuning tab has history, importance, parallel-coordinates and ranking charts (${plots})`);
   if (tab === 'data') { await until(() => S.eda, 20000, 'eda'); await flush(); await flush(); }
   ok(document.querySelector('#dashBody .dashBody, #dashBody .empty') && errors.length === 0, `dashboard tab ${tab}: ${plots} charts, errors ${errors.length}`);
 }
@@ -88,7 +93,7 @@ ok(downloads.length >= 3, 'downloads: ' + downloads.join(', '));
 
 // Agent with tools
 const { saveAI } = await import(new URL('src/ai.js', root));
-saveAI({ apiKey: 'test-key', model: 'gpt-oss:120b', confirm: false, provider: 'cloud' });
+saveAI({ apiKey: 'test-key', model: 'gpt-oss:120b', confirm: false, autoFix: false, provider: 'cloud' });
 script = [
   { tool_calls: [{ function: { name: 'get_leaderboard', arguments: {} } }] },
   { tool_calls: [{ function: { name: 'update_block', arguments: { block: 'rf', settings: { n_estimators: 50, max_depth: 8, bogus: 1 } } } }, { function: { name: 'add_block', arguments: { type: 'model', model_key: 'lgbm' } } }] },
@@ -103,7 +108,7 @@ ok(tools.length === 8 && tools.every(t => t.status === 'done'), 'agent tools: ' 
 ok(S.nodes.some(n => n.key === 'lgbm') && S.nodes.find(n => n.key === 'rf').cfg.n_estimators === 50, 'agent changed the pipeline');
 ok(tools[3].result.figures.length === 1 && tools[3].result.table && S.results.models.custom_extra_trees_300, 'run_python registered a model + figure + table');
 ok(calls[1].messages.some(m => m.role === 'tool' && m.tool_name === 'get_leaderboard'), 'tool results sent back to the model');
-ok(calls[0].tools.length === 14 && calls[0].messages[0].content.includes('Leaderboard'), 'system prompt + 14 tools sent');
+ok(calls[0].tools.length === 19 && calls[0].messages[0].content.includes('Leaderboard'), 'system prompt + 19 tools sent');
 ok(document.querySelectorAll('#chatBox .tool').length === 8, 'tool cards rendered in chat');
 // Approval flow
 saveAI({ confirm: true });
@@ -113,6 +118,34 @@ await until(() => S.chat.items.at(-1)?.tools?.[0]?.status === 'awaiting', 20000,
 document.querySelector('#chatBox .approve .btn.primary').click();
 await until(() => S.chat.items.at(-1)?.content === 'Removed.', 20000, 'after approval');
 ok(!S.nodes.some(n => n.key === 'lgbm'), 'approved tool ran');
+
+// Debugging flow: Pipeline Doctor + broken code cell fixed by the AI + model retrain
+saveAI({ confirm: false });
+const dg = await A.diagnose();
+ok(Array.isArray(dg.issues), 'doctor ran: ' + dg.issues.map(i => `${i.severity}:${i.code}`).join(', '));
+S.ui.dashTab = 'doctor'; renderDashboard(); await flush();
+ok(document.querySelector('#dashBody .kpis') && errors.length === 0, 'diagnostics tab renders');
+await A.writeCell('c2', "acc = accuracy_score(y_test, models[best_model_id].predict(X_test))\nprint(acc)");
+const cell = S.cells.find(c => c.id === 'c2');
+ok(cell.out.error_info?.type === 'NameError' && cell.out.error_info.line === 1 && /Available names/.test(cell.out.error_info.hint), 'broken cell: NameError on line 1 with hint');
+S.ui.dashTab = 'code'; renderDashboard(); await flush();
+ok(document.querySelectorAll('#dashBody textarea.cell').length === S.cells.length && document.querySelector('#dashBody .btn.violet'), 'python lab renders cells + Fix with AI');
+script = [
+  { tool_calls: [{ function: { name: 'diagnose', arguments: {} } }, { function: { name: 'list_code_cells', arguments: {} } }] },
+  { tool_calls: [{ function: { name: 'write_code_cell', arguments: { cell_id: 'c2', code: "from sklearn.metrics import accuracy_score\nacc = accuracy_score(y_test, models[best_model_id].predict(X_test))\nprint(round(acc, 4))" } } }] },
+  { tool_calls: [{ function: { name: 'update_block', arguments: { block: 'rf', settings: { min_samples_leaf: 5 } } } }, { function: { name: 'retrain_models', arguments: { model_ids: ['rf'] } } }] },
+  { tool_calls: [{ function: { name: 'apply_fixes', arguments: { issue_ids: ['all'] } } }] },
+  { content: 'Fixed: the cell was missing an import.' },
+];
+A.fixWithAI('cell', { id: 'c2' });
+await until(() => S.chat.items.at(-1)?.content === 'Fixed: the cell was missing an import.', 180000, 'fix flow');
+const ft = S.chat.items.slice(-6).flatMap(i => i.tools || []);
+ok(ft.map(x => x.name).join() === 'diagnose,list_code_cells,write_code_cell,update_block,retrain_models,apply_fixes' && ft.every(x => x.status === 'done'), 'fix flow tools: ' + ft.map(x => `${x.name}:${x.status}${x.result?.error ? '(' + x.result.error + ')' : ''}`).join(', '));
+ok(cell.out && !cell.out.exception && /0\.\d+/.test(cell.out.stdout), 'cell corrected by the AI, output: ' + cell.out?.stdout?.trim());
+ok(ft[4].result.retrained?.[0]?.status === 'ok', 'retrain_models: ' + JSON.stringify(ft[4].result.retrained));
+ok(calls.some(cl => cl.messages.some(mm => mm.role === 'user' && mm.content.includes('on line 1'))), 'fix prompt contains the failing line');
+const lintOut = await A.runCell((A.addCell("from sklearn.preprocessing import StandardScaler\nsc = StandardScaler().fit(X_test.select_dtypes('number'))")).id);
+ok(lintOut.warnings?.some(w => /test set/.test(w)), 'static review flags fitting on the test set');
 
 // Regression dataset through a template
 await A.loadSample('diabetes');

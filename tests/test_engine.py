@@ -84,5 +84,16 @@ for cvs in ["kfold", "shuffle_split", "stratified_shuffle_split", "time_series",
     c2["dataset"]["group_col"] = "parental_education" if cvs == "group_kfold" else ""
     r = check(E.run(json.dumps(c2)), cvs)
     assert all(m["status"] == "ok" for m in r["models"].values()), (cvs, [m.get("error") for m in r["models"].values()])
+# Optuna TPE / random / QMC, built-in GP Bayesian, custom ranges, and ensembles containing XGBoost
+xl = [m for m in cls_models if m["key"] in ("xgb", "lgbm", "rf", "logreg")]
+for method, sampler in [("optuna", "tpe"), ("optuna", "qmc"), ("bayesian", None)]:
+    tun = {"enabled": True, "method": method, "sampler": sampler or "tpe", "models": "top3", "n_iter": 8, "cv_folds": 3,
+           "grids": {"xgb": {"n_estimators": {"low": 30, "high": 200, "type": "int"}, "learning_rate": {"low": 0.01, "high": 0.3, "log": True}, "max_depth": [3, 5]}}}
+    r = check(E.run(json.dumps(cfg("pass", xl, eval={"permutation": "none", "shap": "none"}, ensembles=[{"id": "st", "key": "stacking", "name": "Stacking", "top_k": 3}], tuning=tun))), method)
+    bad = [(m["name"], m.get("error")) for m in r["models"].values() if m["status"] != "ok"]
+    assert not bad, bad
+    tuned = [m for m in r["models"].values() if m.get("tuning")]
+    assert len(tuned) == 3 and all(len(m["tuning"]["history"]) == 8 for m in tuned), [(m["name"], m["tuning"]["n_trials"]) for m in tuned]
+    print(method, sampler, [(m["name"], m["tuning"]["method"], round(m["tuning"]["before"], 4), round(m["tuning"]["after"], 4), (m["tuning"]["importance"] or [{}])[0].get("param")) for m in tuned])
 print("variants ok")
 print("versions", E.versions())

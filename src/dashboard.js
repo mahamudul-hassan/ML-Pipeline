@@ -5,8 +5,9 @@ import { h, $, fmt, fmtTime, pct, esc, toast, toCSV, download } from './util.js'
 import { icon } from './icons.js';
 import { plot, PALETTE } from './charts.js';
 import { A } from './actions.js';
+import { pythonOutput } from './chat.js';
 
-export const TABS = [['overview', 'Overview', 'home'], ['leaderboard', 'Leaderboard', 'list'], ['model', 'Model Details', 'cpu'], ['compare', 'Compare', 'bars'], ['tuning', 'Tuning', 'sliders'], ['explain', 'Explainability', 'sparkle'], ['data', 'Data Insights', 'db'], ['predict', 'Predict', 'target'], ['logs', 'Pipeline & Logs', 'file'], ['runs', 'Runs', 'history']];
+export const TABS = [['overview', 'Overview', 'home'], ['doctor', 'Diagnostics', 'alert'], ['leaderboard', 'Leaderboard', 'list'], ['model', 'Model Details', 'cpu'], ['compare', 'Compare', 'bars'], ['tuning', 'Tuning', 'sliders'], ['explain', 'Explainability', 'sparkle'], ['data', 'Data Insights', 'db'], ['predict', 'Predict', 'target'], ['code', 'Python Lab', 'code'], ['logs', 'Pipeline & Logs', 'file'], ['runs', 'Runs', 'history']];
 const NEEDS_RESULTS = new Set(['overview', 'leaderboard', 'model', 'compare', 'tuning', 'explain', 'predict', 'logs']);
 const short = (s, n = 28) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
 const ml = m => optLabel(m);
@@ -51,7 +52,7 @@ export function renderDashboard() {
   }
   const body = h('div', { class: 'dashBody' });
   root.append(body);
-  ({ overview, leaderboard, model: modelTab, compare, tuning, explain, data: dataTab, predict: predictTab, logs, runs })[tab](body);
+  ({ overview, doctor, code: codeTab, leaderboard, model: modelTab, compare, tuning, explain, data: dataTab, predict: predictTab, logs, runs })[tab](body);
 }
 
 function runBar() {
@@ -61,7 +62,7 @@ function runBar() {
     return h('div', { class: 'runBar busy' }, h('span', { class: 'runIc', html: icon('cpu', 16) }), h('div', { style: 'flex:1;min-width:0' }, h('div', { class: 'rt' }, p.message || 'Running…'), h('div', { class: 'row', style: 'margin-top:4px' }, h('div', { class: 'progress' }, h('i', { style: `width:${(frac * 100).toFixed(0)}%` })), h('span', { class: 'xs muted' }, p.n ? `${p.i}/${p.n}` : ''), h('span', { class: 'xs muted' }, fmtTime((Date.now() - S.runStart) / 1000)))),
       h('button', { class: 'btn sm danger', html: icon('stop', 11) + ' Stop', onclick: () => A.stop() }));
   }
-  if (S.lastError) return h('div', { class: 'runBar bad' }, h('span', { class: 'runIc', html: icon('alert', 16) }), h('div', { style: 'flex:1;min-width:0' }, h('div', { class: 'rt' }, 'Run failed'), h('div', { class: 'rs' }, S.lastError)), h('button', { class: 'btn sm', onclick: () => A.askAI(`The pipeline run failed with this error: ${S.lastError}\nWhat is wrong and how do I fix it?`) }, 'Ask AI'));
+  if (S.lastError) return h('div', { class: 'runBar bad' }, h('span', { class: 'runIc', html: icon('alert', 16) }), h('div', { style: 'flex:1;min-width:0' }, h('div', { class: 'rt' }, 'Run failed'), h('div', { class: 'rs' }, S.lastError)), h('button', { class: 'btn sm violet', html: icon('wand', 12) + ' Diagnose & fix with AI', onclick: () => A.fixWithAI('run') }), h('button', { class: 'btn sm', onclick: () => { S.ui.dashTab = 'doctor'; renderDashboard(); } }, 'Diagnostics'));
   const r = R();
   if (!r) return h('div', { class: 'runBar idle' }, h('span', { class: 'runIc', html: icon('play', 14) }), h('div', { style: 'flex:1' }, h('div', { class: 'rt' }, 'Not run yet'), h('div', { class: 'rs' }, S.engine.status === 'ready' ? 'Configure the blocks, then press Run Pipeline.' : S.engine.message)), h('button', { class: 'btn run sm', disabled: S.engine.status !== 'ready', html: icon('play', 11) + ' Run', onclick: () => A.run() }));
   const best = r.models[r.best];
@@ -69,6 +70,7 @@ function runBar() {
   return h('div', { class: 'runBar ok' }, h('span', { class: 'runIc', html: icon('check', 16, 2.4) }), h('div', { style: 'flex:1;min-width:0' },
     h('div', { class: 'rt' }, `Completed in ${fmtTime(r.duration)} · ${nOk} models trained${nErr ? `, ${nErr} failed` : ''}`),
     h('div', { class: 'rs' }, `Best: ${best.name} — ${ml(r.primary)} ${fmt(best.score)} (${best.score_source.toUpperCase()}), test ${fmt(best.test[r.primary])}${S.dirty ? ' · pipeline changed since this run' : ''}`)),
+    issueButton(),
     h('button', { class: 'btn sm', onclick: () => A.askAI('Summarise the results of all models and recommend what to do next.') }, h('span', { html: icon('sparkle', 13) }), 'AI summary'));
 }
 
@@ -141,7 +143,7 @@ function leaderboard(body) {
     h('button', { class: 'btn sm', html: icon('download', 13) + ' CSV', onclick: () => downloadLeaderboard() })));
   const tbl = h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, ''), h('th', {}, '#'), th('Model', 'meta:name'), h('th', {}, 'Family'), mets.map(m => th(ml(m), sp + ':' + m)), r.cv ? th(`CV std (${ml(r.primary)})`, 'meta:std') : null, th('Train−test gap', 'meta:gap', `${ml(r.primary)} on train minus test`), th('Fit time', 'meta:fit')));
   rows.forEach((m, i) => {
-    if (m.status !== 'ok') { tbl.append(h('tr', { class: 'errrow' }, h('td', {}), h('td', {}, '—'), h('td', {}, m.name), h('td', {}, m.family), h('td', { colspan: mets.length + 3, style: 'white-space:normal' }, short(m.error || 'failed', 160)))); return; }
+    if (m.status !== 'ok') { tbl.append(h('tr', { class: 'errrow' }, h('td', {}), h('td', {}, '—'), h('td', {}, m.name), h('td', {}, m.family), h('td', { colspan: mets.length + 3, style: 'white-space:normal' }, short(m.error || 'failed', 160), ' ', h('button', { class: 'btn sm violet', html: icon('wand', 12) + ' Fix with AI', onclick: () => A.fixWithAI('model', { id: m.id, name: m.name, error: m.error }) })))); return; }
     tbl.append(h('tr', { class: 'click' + (m.id === r.best ? ' hl' : ''), onclick: e => { if (e.target.closest('input')) return; openModel(m.id); } },
       h('td', {}, h('input', { type: 'checkbox', checked: cmpSet.has(m.id), 'aria-label': 'Compare ' + m.name, onchange: e => { if (e.target.checked) S.ui.compare = [...cmpSet, m.id]; else S.ui.compare = [...cmpSet].filter(x => x !== m.id); renderDashboard(); } })),
       h('td', {}, m.baseline ? '—' : r.ranking.indexOf(m.id) + 1), h('td', {}, m.name, m.tuned_from ? h('span', { class: 'chip', style: 'margin-left:6px' }, 'tuned') : null, m.ensemble ? h('span', { class: 'chip', style: 'margin-left:6px' }, 'ensemble') : null), h('td', { class: 'muted' }, m.family),
@@ -266,19 +268,27 @@ function tuning(body) {
   if (!tuned.length) { body.append(h('div', { class: 'empty' }, 'No tuning results. Add the Hyperparameter Tuning block (and keep "Tune automatically" on) or ask the AI to tune specific models.')); return; }
   const pm = r.primary;
   body.append(h('div', { class: 'scrollx' }, h('table', { class: 'tbl' }, h('tr', {}, ['Model', 'Method', 'Candidates', 'Time', `Before (${ml(pm)})`, 'After', 'Change', 'Test after', 'Best parameters'].map(x => h('th', {}, x))),
-    tuned.map(m => { const dlt = (m.tuning.after ?? 0) - (m.tuning.before ?? 0); const good = lower(pm) ? dlt < 0 : dlt > 0; return h('tr', { class: 'click', onclick: () => { S.ui.tuneModel = m.id; renderDashboard(); } }, h('td', {}, m.name), h('td', {}, optLabel(m.tuning.method)), h('td', { class: 'num' }, m.tuning.n_trials), h('td', { class: 'num' }, fmtTime(m.tuning.time)), h('td', { class: 'num' }, fmt(m.tuning.before)), h('td', { class: 'num' }, fmt(m.tuning.after)), h('td', { class: 'num ' + (good ? 'okc' : dlt === 0 ? '' : 'err') }, (dlt > 0 ? '+' : '') + fmt(dlt)), h('td', { class: 'num' }, fmt(m.test[pm])), h('td', { class: 'mono xs', style: 'white-space:normal' }, Object.entries(m.tuning.best_params).map(([k, v]) => `${k}=${Array.isArray(v) ? v.join(',') : v}`).join('  '))); }))));
+    tuned.map(m => { const dlt = (m.tuning.after ?? 0) - (m.tuning.before ?? 0); const good = lower(pm) ? dlt < 0 : dlt > 0; return h('tr', { class: 'click', onclick: () => { S.ui.tuneModel = m.id; renderDashboard(); } }, h('td', {}, m.name), h('td', {}, m.tuning.method === 'optuna' ? `Optuna (${String(m.tuning.sampler || 'tpe').toUpperCase()})` : optLabel(m.tuning.method)), h('td', { class: 'num' }, m.tuning.n_trials), h('td', { class: 'num' }, fmtTime(m.tuning.time)), h('td', { class: 'num' }, fmt(m.tuning.before)), h('td', { class: 'num' }, fmt(m.tuning.after)), h('td', { class: 'num ' + (good ? 'okc' : dlt === 0 ? '' : 'err') }, (dlt > 0 ? '+' : '') + fmt(dlt)), h('td', { class: 'num' }, fmt(m.test[pm])), h('td', { class: 'mono xs', style: 'white-space:normal' }, Object.entries(m.tuning.best_params).map(([k, v]) => `${k}=${Array.isArray(v) ? v.join(',') : v}`).join('  '))); }))));
   const m = r.models[S.ui.tuneModel] && r.models[S.ui.tuneModel].tuning ? r.models[S.ui.tuneModel] : tuned[0];
   const t = m.tuning;
-  const par = chart('chart tall'), trials = chart();
+  const par = chart('chart tall'), trials = chart(), hist = chart(), imp = chart();
   body.append(h('div', { class: 'row', style: 'margin-top:12px' }, h('span', { class: 'sm muted' }, 'Search details for'), modelSelect(m.id, id => { S.ui.tuneModel = id; renderDashboard(); }, tuned)));
+  const methodLabel = t.method === 'optuna' ? `Optuna · ${optLabel(t.sampler || 'tpe')} sampler` : optLabel(t.method);
+  body.append(h('div', { class: 'note', style: 'margin-top:8px' }, `${methodLabel}: ${t.n_trials} trials${t.n_failed ? ` (${t.n_failed} failed)` : ''} in ${fmtTime(t.time)}, ${t.folds}-fold CV each. Best: ${Object.entries(t.best_params).map(([k, v]) => `${k}=${fmtParam(v)}`).join(', ')}.${t.note ? ' ' + t.note : ''}`));
+  body.append(h('div', { class: 'grid2' }, card('Optimisation history (best so far)', hist), card('Hyperparameter importance', imp)));
   body.append(h('div', { class: 'grid2' }, card('Candidates (parallel coordinates, colour = score)', par), card(`Candidates ranked — CV ${ml(pm)}`, trials)));
-  body.append(card('Top candidates', h('div', { class: 'scrollx', style: 'max-height:320px' }, h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, 'Rank'), Object.keys(t.grid).map(k => h('th', { class: 'mono' }, k)), h('th', {}, `CV ${ml(pm)}`), h('th', {}, 'Std'), h('th', {}, 'Fit time')),
-    t.trials.slice(0, 25).map(tr => h('tr', { class: tr.rank === 1 ? 'hl' : '' }, h('td', {}, tr.rank), Object.keys(t.grid).map(k => h('td', { class: 'mono' }, fmtParam(tr.params[k]))), h('td', { class: 'num' }, fmt(tr.mean)), h('td', { class: 'num' }, fmt(tr.std, 3)), h('td', { class: 'num' }, fmtTime(tr.fit_time))))))));
+  body.append(card('Top candidates', h('div', { class: 'scrollx', style: 'max-height:320px' }, h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, 'Rank'), h('th', {}, 'Trial'), Object.keys(t.grid).map(k => h('th', { class: 'mono' }, k)), h('th', {}, `CV ${ml(pm)}`), h('th', {}, 'Std'), h('th', {}, 'Fit time')),
+    t.trials.slice(0, 25).map(tr => h('tr', { class: tr.rank === 1 ? 'hl' : '' }, h('td', {}, tr.rank), h('td', { class: 'muted' }, (tr.number ?? 0) + 1), Object.keys(t.grid).map(k => h('td', { class: 'mono' }, fmtParam(tr.params[k]))), h('td', { class: 'num' }, fmt(tr.mean)), h('td', { class: 'num' }, fmt(tr.std, 3)), h('td', { class: 'num' }, fmtTime(tr.fit_time))))))));
   later(() => {
+    if (t.history?.length) plot(hist, [{ type: 'scatter', mode: 'markers', name: 'trial', x: t.history.map(x => x.number + 1), y: t.history.map(x => x.value), marker: { size: 7, color: '#3d6df5', opacity: 0.7 } }, { type: 'scatter', mode: 'lines', name: 'best so far', line: { shape: 'hv', width: 3, color: '#22c55e' }, x: t.history.map(x => x.number + 1), y: t.history.map(x => x.best) }, { type: 'scatter', mode: 'lines', name: 'before tuning', x: [1, t.history.length], y: [t.before, t.before], line: { dash: 'dash', color: '#f59e0b' } }], { xaxis: { title: 'Trial' }, yaxis: { title: `CV ${ml(pm)}` } });
+    else hist.innerHTML = '<div class="empty">No history for this run.</div>';
+    if (t.importance?.length) plot(imp, [{ type: 'bar', orientation: 'h', y: t.importance.map(x => x.param).reverse(), x: t.importance.map(x => x.importance).reverse(), marker: { color: '#a855f7' } }], { margin: { l: 150, r: 10, t: 8, b: 36 }, xaxis: { title: 'Importance (random forest on trials)' } });
+    else imp.innerHTML = '<div class="empty">Needs at least 6 successful trials with varying scores.</div>';
     const keys = Object.keys(t.grid);
     const dims = keys.map(k => {
       const vals = t.trials.map(x => x.params[k]);
       const numeric = vals.every(v => typeof v === 'number');
+      if (numeric && t.grid[k] && !Array.isArray(t.grid[k]) && t.grid[k].log) return { label: k + ' (log10)', values: vals.map(v => Math.log10(v)) };
       if (numeric) return { label: k, values: vals };
       const cats = [...new Set(vals.map(fmtParam))];
       return { label: k, values: vals.map(v => cats.indexOf(fmtParam(v))), tickvals: cats.map((_, i) => i), ticktext: cats };
@@ -440,4 +450,78 @@ function runs(body) {
     S.history.map((x, i) => h('tr', {}, h('td', {}, i + 1), h('td', {}, new Date(x.time).toLocaleTimeString()), h('td', {}, x.dataset), h('td', {}, x.target), h('td', { class: 'num' }, x.models), h('td', {}, x.best), h('td', {}, ml(x.metric)), h('td', { class: 'num' }, fmt(x.score)), h('td', { class: 'num' }, fmt(x.test)), h('td', { class: 'num' }, fmtTime(x.duration)), h('td', {}, h('button', { class: 'btn sm', onclick: () => A.restoreRun(i) }, 'Restore pipeline')))))),
   card('Best score per run', c));
   later(() => plot(c, [{ type: 'scatter', mode: 'lines+markers+text', x: S.history.map((_, i) => 'Run ' + (i + 1)), y: S.history.map(x => x.score), text: S.history.map(x => short(x.best, 14)), textposition: 'top center', textfont: { size: 9 } }], { yaxis: { title: 'Best score' } }));
+}
+
+// --------------------------------------------------------- pipeline doctor
+function issueButton() {
+  const is = S.diag?.issues || [];
+  const n = is.filter(i => i.severity !== 'info').length;
+  if (!n) return null;
+  const errs = is.filter(i => i.severity === 'error').length;
+  return h('button', { class: 'btn sm' + (errs ? ' danger' : ''), html: icon('alert', 13) + ` ${n} issue${n > 1 ? 's' : ''}`, onclick: () => { S.ui.dashTab = 'doctor'; renderDashboard(); } });
+}
+export function describeFix(fix) {
+  return (fix || []).map(p => {
+    if (p.add_block) return `add a ${p.add_block} block`;
+    if (p.remove) return `remove block ${p.block}`;
+    if (p.add_exclude) return `exclude ${p.add_exclude.join(', ')} from training`;
+    if (p.remove_feature) return `delete custom feature ${p.remove_feature}`;
+    return `${p.block}: ${Object.entries(p.settings || {}).map(([k, v]) => `${k} = ${Array.isArray(v) ? v.join(', ') : optLabel(v)}`).join(', ')}`;
+  }).join(' · ');
+}
+function doctor(body) {
+  const dg = S.diag;
+  const fixable = (dg?.issues || []).filter(i => i.fix && !dg.applied?.has(i.id));
+  body.append(h('div', { class: 'row', style: 'margin-bottom:10px' },
+    h('button', { class: 'btn sm', html: icon('refresh', 13) + ' Run checks', onclick: async () => { await A.diagnose(); renderDashboard(); } }),
+    dg ? h('span', { class: 'xs muted' }, `Checked ${new Date(dg.time).toLocaleTimeString()}${S.results ? ' · includes results of the last run' : ''}`) : null, h('span', { class: 'sp' }),
+    h('button', { class: 'btn sm', disabled: !fixable.length, onclick: () => { A.applyFixes(['all']); renderDashboard(); } }, `Apply all fixes (${fixable.length})`),
+    h('button', { class: 'btn sm violet', disabled: !dg?.issues?.length, html: icon('wand', 12) + ' Fix everything with AI', onclick: () => A.fixWithAI('doctor') })));
+  if (!dg) { body.append(h('div', { class: 'empty' }, 'Checking the pipeline…')); A.diagnose().then(() => { if (S.ui.dashTab === 'doctor') renderDashboard(); }); return; }
+  if (dg.error) body.append(h('div', { class: 'note warn' }, dg.error));
+  const count = s => dg.issues.filter(i => i.severity === s).length;
+  body.append(h('div', { class: 'kpis', style: 'grid-template-columns:repeat(3,minmax(0,1fr))' },
+    h('div', { class: 'kpi' }, h('div', { class: 'l' }, 'Errors'), h('div', { class: 'v err' }, count('error')), h('div', { class: 's' }, 'break the run or invalidate the results')),
+    h('div', { class: 'kpi' }, h('div', { class: 'l' }, 'Warnings'), h('div', { class: 'v warnc' }, count('warning')), h('div', { class: 's' }, 'likely conceptual mistakes')),
+    h('div', { class: 'kpi' }, h('div', { class: 'l' }, 'Notes'), h('div', { class: 'v' }, count('info')), h('div', { class: 's' }, 'suggestions'))));
+  if (!dg.issues.length) { body.append(h('div', { class: 'empty', style: 'margin-top:10px' }, '✓ No problems found in the data, the pipeline settings or the last results.')); return; }
+  const list = h('div', { style: 'display:flex;flex-direction:column;gap:8px;margin-top:10px' });
+  for (const i of dg.issues) {
+    const done = dg.applied?.has(i.id);
+    list.append(h('div', { class: 'card issue ' + i.severity },
+      h('div', { class: 'ct' }, h('span', { class: 'chip sev ' + i.severity }, i.severity), i.title, done ? h('span', { class: 'chip okc' }, 'fix applied') : null),
+      h('div', { class: 'sm' }, i.detail),
+      i.fix ? h('div', { class: 'xs muted', style: 'margin-top:6px' }, 'Fix: ' + describeFix(i.fix)) : null,
+      h('div', { class: 'mact' }, i.fix && !done ? h('button', { class: 'btn sm primary', onclick: () => { A.applyFixes([i.id]); renderDashboard(); } }, 'Apply fix') : null,
+        h('button', { class: 'btn sm', html: icon('wand', 12) + ' Fix with AI', onclick: () => A.fixWithAI('issue', { issue: i }) }),
+        i.model && S.results?.models[i.model] ? h('button', { class: 'btn sm ghost', onclick: () => openModel(i.model) }, 'Open model') : null)));
+  }
+  body.append(list, h('div', { class: 'xs muted', style: 'margin-top:8px' }, 'After applying fixes, run the pipeline again. The checks re-run automatically after every run.'));
+}
+
+// --------------------------------------------------------------- python lab
+function codeTab(body) {
+  body.append(h('div', { class: 'row', style: 'margin-bottom:8px' },
+    h('button', { class: 'btn sm', html: icon('plus', 13) + ' Add cell', onclick: () => { A.addCell(''); renderDashboard(); } }),
+    h('button', { class: 'btn sm', html: icon('play', 11) + ' Run all', onclick: async () => { for (const c of S.cells) { const r = await A.runCell(c.id); if (r?.exception || r?.error) break; } } }),
+    h('span', { class: 'sp' }),
+    h('button', { class: 'btn sm violet', html: icon('wand', 12) + ' Ask AI to write code', onclick: () => { const t = prompt('What should the code do?'); if (t) A.askAI(`${t}\nWrite it as a Python Lab cell with write_code_cell, run it, and fix it until it works.`); } })));
+  body.append(h('div', { class: 'note', style: 'margin:0 0 10px' }, 'Available: df, X_train, X_val, X_test, y_train, y_val, y_test, models (fitted pipelines), results, best_model_id, classes, task, register_model(name, estimator), make_preprocessor(), predict(model_id, rows), compute_metrics(y, pred), np, pd, plt. Shift+Enter runs a cell. Cells share one namespace.'));
+  for (const c of S.cells) {
+    const status = c.running ? 'running…' : c.out ? (c.out.exception || c.out.error ? 'error' : 'ok') : 'not run';
+    const ta = h('textarea', { class: 'mono cell', rows: Math.min(24, Math.max(3, c.code.split('\n').length + 1)), spellcheck: 'false', 'aria-label': `Code of cell ${c.id}`,
+      oninput: e => { c.code = e.target.value; A.saveCells(); },
+      onkeydown: e => {
+        if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); A.runCell(c.id); }
+        if (e.key === 'Tab') { e.preventDefault(); const s = e.target.selectionStart; e.target.setRangeText('    ', s, e.target.selectionEnd, 'end'); c.code = e.target.value; A.saveCells(); }
+      } }, c.code);
+    const err = status === 'error', warn = c.out?.warnings?.length;
+    body.append(h('div', { class: 'card', style: 'margin-bottom:10px' },
+      h('div', { class: 'ct' }, h('span', { class: 'mono' }, `[${c.id}]`), h('span', { class: 'chip ' + (err ? 'sev error' : status === 'ok' ? 'okc' : '') }, status), warn ? h('span', { class: 'chip sev warning' }, `${warn} review warning${warn > 1 ? 's' : ''}`) : null, h('span', { class: 'sp' }),
+        h('button', { class: 'btn sm run', disabled: c.running, html: icon('play', 10) + ' Run', onclick: () => A.runCell(c.id) }),
+        err || warn ? h('button', { class: 'btn sm violet', html: icon('wand', 12) + ' Fix with AI', onclick: () => A.fixWithAI('cell', { id: c.id }) }) : null,
+        h('button', { class: 'btn sm', onclick: () => A.fixWithAI('review', { id: c.id }) }, 'Review with AI'),
+        h('button', { class: 'ib sm', 'aria-label': 'Delete cell', html: icon('trash', 14), onclick: () => { S.cells = S.cells.filter(x => x !== c); A.saveCells(); renderDashboard(); } })),
+      ta, c.out ? h('div', { style: 'margin-top:8px' }, pythonOutput(c.out)) : null));
+  }
 }

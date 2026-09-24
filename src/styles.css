@@ -229,6 +229,13 @@ pre.box{background:var(--sunken);border:1px solid var(--line);border-radius:8px;
 .logLine time{color:var(--faint);flex:none;font-variant-numeric:tabular-nums}
 .logLine.warn span{color:var(--warn)}.logLine.error span{color:var(--err)}
 
+/* doctor + python lab */
+.chip.sev.error{color:#fff;background:var(--err);border-color:var(--err)}
+.chip.sev.warning{color:#1b1400;background:var(--warn);border-color:var(--warn)}
+.chip.sev.info{color:var(--accent)}
+.card.issue.error{border-left:3px solid var(--err)}.card.issue.warning{border-left:3px solid var(--warn)}.card.issue.info{border-left:3px solid var(--accent)}
+textarea.cell{font-size:12.5px;line-height:1.5;min-height:70px;background:var(--sunken);white-space:pre;overflow:auto;tab-size:4}
+
 /* modal + toast */
 .modalBack{position:fixed;inset:0;background:rgba(4,9,22,.6);display:grid;place-items:center;z-index:60;padding:16px}
 .modal{background:var(--panel);border:1px solid var(--line-2);border-radius:14px;width:min(720px,100%);max-height:88vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.4)}
