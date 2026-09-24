@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ML Agent — AI-powered machine learning pipeline builder</title>
+<meta name="description" content="Build, train, tune and explain scikit-learn pipelines visually, with an Ollama Cloud AI agent. Everything runs in your browser.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./src/styles.css">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
+<script type="module" src="./src/main.js"></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo" data-icon="hex" data-size="22"></span>
+    <div><div class="bt">ML Agent <span class="beta">BETA</span></div><div class="bs">AI-Powered Machine Learning Pipeline Builder</div></div>
+  </div>
+  <label class="search"><span data-icon="search" data-size="16"></span><input id="askInput" type="text" placeholder="Ask AI to build or modify your pipeline…" aria-label="Ask the AI assistant"><span class="xs" style="opacity:.7">Enter ↵</span></label>
+  <div class="hright">
+    <span class="pill hide-sm" id="enginePill"></span>
+    <button class="pill" id="aiPill" title="AI settings"></button>
+    <button class="ib" id="btnSettings" aria-label="Settings" data-icon="gear"></button>
+    <button class="ib" id="btnTheme" aria-label="Toggle light / dark theme"></button>
+    <div class="user"><span class="av" id="userAv">MH</span><span class="un" id="userName"></span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="Main">
+    <div class="nav">
+      <button class="nv on" data-go="pipelinePanel"><span data-icon="home"></span><span class="lbl">Pipeline Builder</span></button>
+      <button class="nv" data-go="dataPanel"><span data-icon="db"></span><span class="lbl">Datasets</span></button>
+      <button class="nv" data-go="chatPanel"><span data-icon="bot"></span><span class="lbl">AI Assistant</span></button>
+      <button class="nv" data-go="dash" data-tab="overview"><span data-icon="chart"></span><span class="lbl">Dashboard</span></button>
+      <button class="nv" data-go="dash" data-tab="leaderboard"><span data-icon="list"></span><span class="lbl">Leaderboard</span></button>
+      <button class="nv" data-go="dash" data-tab="runs"><span data-icon="history"></span><span class="lbl">Experiments</span></button>
+      <button class="nv" data-go="dash" data-tab="predict"><span data-icon="target"></span><span class="lbl">Predict</span></button>
+      <button class="nv" data-act="settings"><span data-icon="gear"></span><span class="lbl">Settings</span></button>
+    </div>
+    <div class="qat">Quick Actions</div>
+    <div class="qa">
+      <button class="qb" data-act="templates"><span data-icon="plusSq" data-size="16"></span>New pipeline</button>
+      <button class="qb" data-act="upload"><span data-icon="upload" data-size="16"></span>Upload data</button>
+      <button class="qb" data-act="samples"><span data-icon="db" data-size="16"></span>Sample datasets</button>
+      <button class="qb" data-act="export"><span data-icon="download" data-size="16"></span>Export project</button>
+    </div>
+    <div class="agentCard">
+      <div class="t"><span data-icon="sparkle" data-size="16"></span>AI Agent</div>
+      <p>Free Ollama Cloud models build, tune and analyse your pipeline, and work with trained models.</p>
+      <button class="btn violet wide sm" data-act="ai">Connect Ollama</button>
+    </div>
+  </nav>
+
+  <main class="main">
+    <section class="row1">
+      <div class="panel" id="pipelinePanel">
+        <div class="cph">
+          <div><h1>Pipeline Builder</h1><p>Design your machine learning workflow visually</p></div>
+          <div class="cpa">
+            <button class="btn save" id="btnSave"><span data-icon="save" data-size="15"></span>Save</button>
+            <button class="btn" id="btnLoad"><span data-icon="folder" data-size="15"></span>Load</button>
+            <button class="btn run" id="btnRun" disabled></button>
+            <div class="menuWrap">
+              <button class="btn icon" id="btnMore" aria-label="More actions" data-icon="dots"></button>
+              <div class="menu" id="moreMenu" hidden>
+                <button data-act="templates"><span data-icon="layout" data-size="15"></span>Templates…</button>
+                <button data-act="exportZip"><span data-icon="download" data-size="15"></span>Export project (.zip)</button>
+                <button data-act="exportJson"><span data-icon="save" data-size="15"></span>Export pipeline (.json)</button>
+                <button data-act="lb"><span data-icon="list" data-size="15"></span>Leaderboard (.csv)</button>
+                <button data-act="reset"><span data-icon="refresh" data-size="15"></span>Reset to default pipeline</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="canvasBox">
+          <div class="canvasWrap" id="cwrap"><div class="stage" id="stage"><div class="world" id="world"><svg id="edges"></svg><div id="nodes"></div></div></div></div>
+          <div class="canvasTools">
+            <button class="btn sm" id="btnAdd"><span data-icon="plus" data-size="14"></span>Add block</button>
+            <button class="btn sm" id="btnTidy"><span data-icon="layout" data-size="14"></span>Tidy layout</button>
+            <span class="hint" id="runStatus"></span>
+            <div class="addMenu" id="addMenu" hidden></div>
+          </div>
+        </div>
+      </div>
+      <aside class="panel config" id="configPanel" aria-label="Block configuration">
+        <div class="ph"><span data-icon="sliders" data-size="16"></span>Block Configuration</div>
+        <div class="cfgScroll" id="cfgBody"></div>
+      </aside>
+    </section>
+
+    <section class="row2">
+      <div class="panel" id="dataPanel">
+        <div class="ph"><span data-icon="db" data-size="16"></span>Dataset Details</div>
+        <div class="pb" id="dsBody" style="display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden"></div>
+      </div>
+      <div class="panel" id="chatPanel">
+        <div class="ph"><span data-icon="bot" data-size="16"></span>AI Assistant<span class="sp"></span><span class="xs muted" id="chatModel" style="font-weight:500"></span><button class="ib sm" id="chatClear" aria-label="Clear chat" data-icon="trash" data-size="15"></button></div>
+        <div id="chatBox" style="display:flex;flex-direction:column;flex:1;min-height:0"></div>
+      </div>
+      <div class="panel docs" id="docsPanel">
+        <div class="ph"><span data-icon="file" data-size="16"></span>Extra Documents &amp; Instructions</div>
+        <div class="pb" id="docsBody" style="overflow:auto;flex:1"></div>
+      </div>
+    </section>
+
+    <section class="panel dash" id="dash">
+      <div class="ph"><span data-icon="chart" data-size="16"></span>Results Dashboard</div>
+      <div class="pb"><div class="tabs" id="dashTabs" role="tablist"></div><div id="dashBody"></div></div>
+    </section>
+  </main>
+</div>
+
+<input type="file" id="fileIn" accept=".csv,.tsv,.txt,.xlsx,.xls,.json" hidden>
+<input type="file" id="pipeIn" accept=".json" hidden>
+<div id="toast" aria-live="polite"></div>
+<div class="boot" id="boot" role="status"></div>
+</body>
+</html>

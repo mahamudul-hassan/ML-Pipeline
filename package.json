@@ -1,0 +1,13 @@
+{
+  "name": "ml-agent",
+  "version": "2.0.0",
+  "description": "Visual ML pipeline builder with real scikit-learn in the browser (Pyodide) and an Ollama Cloud AI agent.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node dev-server.mjs",
+    "test:engine": "python3 tests/test_engine.py"
+  },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
